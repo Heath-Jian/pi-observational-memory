@@ -41,6 +41,7 @@ function setup(args: {
 	reflectAfterTokens?: number;
 	observationsPoolMaxTokens?: number;
 	observationsPoolTargetTokens?: number;
+	showWorkerNotifications?: boolean;
 	passive?: boolean;
 	consolidationInFlight?: boolean;
 	appendEntryReturnsId?: boolean;
@@ -60,6 +61,7 @@ function setup(args: {
 	let launchedWork: (() => Promise<void>) | undefined;
 	const runtime = {
 		config: {
+			showWorkerNotifications: args.showWorkerNotifications ?? true,
 			passive: args.passive ?? false,
 			debugLog: false,
 			observeAfterTokens: args.observeAfterTokens ?? 1,
@@ -238,6 +240,55 @@ describe("V3 consolidation trigger", () => {
 		expect(pi.appendEntry).not.toHaveBeenCalled();
 		expect(mockAgents.runReflector).not.toHaveBeenCalled();
 		expect(mockAgents.runDropper).not.toHaveBeenCalled();
+	});
+
+	it("shows routine worker notifications by default", async () => {
+		const newRef = reflection("ffffffffffff", ["aaaaaaaaaaaa"]);
+		mockAgents.runObserver.mockResolvedValueOnce([obsA]);
+		mockAgents.runReflector.mockResolvedValueOnce([newRef]);
+		mockAgents.runDropper.mockResolvedValueOnce(["aaaaaaaaaaaa"]);
+		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
+		const { fire, runLaunchedWork, ctx } = setup({ entries, observationsPoolTargetTokens: 5 });
+
+		fire();
+		await runLaunchedWork();
+
+		expect(ctx.ui.notify.mock.calls).toEqual([
+			["Observational memory: observer running on ~2-token chunk", "info"],
+			["Observational memory: 1 observation recorded", "info"],
+			["Observational memory: reflector running (~2 tokens)", "info"],
+			["Observational memory: dropper running after reflection — active observation pool ~10 / 5 target tokens (200%)", "info"],
+		]);
+	});
+
+	it("suppresses routine worker notifications without hiding warnings", async () => {
+		const newRef = reflection("ffffffffffff", ["aaaaaaaaaaaa"]);
+		mockAgents.runObserver.mockResolvedValueOnce([obsA]);
+		mockAgents.runReflector.mockResolvedValueOnce([newRef]);
+		mockAgents.runDropper.mockResolvedValueOnce(["aaaaaaaaaaaa"]);
+		const entries = [textCustomMessage("raw-1", "aaaaaaaa")];
+		const quiet = setup({ entries, observationsPoolTargetTokens: 5, showWorkerNotifications: false });
+
+		quiet.fire();
+		await quiet.runLaunchedWork();
+
+		expect(mockAgents.runObserver).toHaveBeenCalledOnce();
+		expect(mockAgents.runReflector).toHaveBeenCalledOnce();
+		expect(mockAgents.runDropper).toHaveBeenCalledOnce();
+		expect(quiet.ctx.ui.notify).not.toHaveBeenCalled();
+
+		mockAgents.runObserver.mockReset();
+		mockAgents.runObserver.mockResolvedValueOnce(undefined);
+		const noOutput = setup({ entries, reflectAfterTokens: 999, showWorkerNotifications: false });
+
+		noOutput.fire();
+		await noOutput.runLaunchedWork();
+
+		expect(noOutput.ctx.ui.notify).toHaveBeenCalledOnce();
+		expect(noOutput.ctx.ui.notify).toHaveBeenCalledWith(
+			"Observational memory: observer returned no observations",
+			"warning",
+		);
 	});
 
 	it("model resolution failure skips appending and notifies once", async () => {

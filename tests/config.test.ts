@@ -44,6 +44,7 @@ describe("V3 config", () => {
 			observationsPoolMaxTokens: 20000,
 			observationsPoolTargetTokens: 10000,
 			agentMaxTurns: 16,
+			showWorkerNotifications: true,
 			passive: false,
 			debugLog: false,
 		});
@@ -60,6 +61,7 @@ describe("V3 config", () => {
 				observationsPoolTargetTokens: 15,
 				agentMaxTurns: 5,
 				model: { provider: "anthropic", id: "global", thinking: "medium" },
+				showWorkerNotifications: true,
 				passive: false,
 				debugLog: true,
 			},
@@ -68,6 +70,7 @@ describe("V3 config", () => {
 			"observational-memory": {
 				observeAfterTokens: 100,
 				model: { provider: "openai", id: "project", thinking: "low" },
+				showWorkerNotifications: false,
 			},
 		});
 
@@ -79,6 +82,7 @@ describe("V3 config", () => {
 			observationsPoolTargetTokens: 15,
 			agentMaxTurns: 5,
 			model: { provider: "openai", id: "project", thinking: "low" },
+			showWorkerNotifications: false,
 			passive: true,
 			debugLog: true,
 		});
@@ -94,6 +98,7 @@ describe("V3 config", () => {
 				observationsPoolTargetTokens: "10000",
 				agentMaxTurns: null,
 				model: { provider: "anthropic", id: "", thinking: "huge" },
+				showWorkerNotifications: "no",
 				passive: "yes",
 				debugLog: "true",
 			},

@@ -74,6 +74,10 @@ function anyStageDue(entries: Entry[], runtime: Runtime): boolean {
 		|| rawTokensSinceReflectionCoverage(entries) >= runtime.config.reflectAfterTokens;
 }
 
+function shouldNotifyWorker(runtime: Runtime, ctx: ConsolidationCtx): boolean {
+	return runtime.config.showWorkerNotifications && ctx.hasUI;
+}
+
 function makeModelResolver(runtime: Runtime, ctx: ConsolidationCtx): (stage: "observer" | "reflector" | "dropper") => Promise<ResolvedModel | undefined> {
 	let cached: ResolveResult | undefined;
 	return async (stage) => {
@@ -200,7 +204,7 @@ async function runObserverStage(
 	const priorReflections = memory.reflections.map(reflectionToSummaryLine);
 	const priorObservations = memory.observations.map(observationToSummaryLine);
 
-	if (ctx.hasUI) ctx.ui?.notify(
+	if (shouldNotifyWorker(runtime, ctx)) ctx.ui?.notify(
 		`Observational memory: observer running on ~${tokens.toLocaleString()}-token chunk`,
 		"info",
 	);
@@ -245,7 +249,7 @@ async function runObserverStage(
 	});
 	appendEntry(pi, OM_OBSERVATIONS_RECORDED, data);
 	debugLog("observer.appended", { count: observations.length, coversUpToId });
-	if (ctx.hasUI) ctx.ui?.notify(
+	if (shouldNotifyWorker(runtime, ctx)) ctx.ui?.notify(
 		`Observational memory: ${observations.length} observation${observations.length === 1 ? "" : "s"} recorded`,
 		"info",
 	);
@@ -265,7 +269,7 @@ async function runReflectorStage(
 	const observationCoverageId = latestCoverageMarkerId(entries, OM_OBSERVATIONS_RECORDED);
 	if (!observationCoverageId) return { outcome: "continue", sameRunReflections: [] };
 
-	if (ctx.hasUI) ctx.ui?.notify(
+	if (shouldNotifyWorker(runtime, ctx)) ctx.ui?.notify(
 		`Observational memory: reflector running (~${reflectionTokens.toLocaleString()} tokens)`,
 		"info",
 	);
@@ -337,7 +341,7 @@ async function runDropperStage(
 		maxDropsAllowed: metrics.maxDropsAllowed,
 	});
 
-	if (ctx.hasUI) ctx.ui?.notify(
+	if (shouldNotifyWorker(runtime, ctx)) ctx.ui?.notify(
 		`Observational memory: dropper running after reflection — active observation pool ~${metrics.observationTokens.toLocaleString()} / ${metrics.targetTokens.toLocaleString()} target tokens (${Math.round(metrics.fullness * 100).toLocaleString()}%)`,
 		"info",
 	);
