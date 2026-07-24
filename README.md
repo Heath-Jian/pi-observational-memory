@@ -122,6 +122,15 @@ That gives you two big benefits:
 1. **Less coherence loss** — important context is preserved as observations and reflections instead of repeatedly compressed through summary chains.
 2. **Faster compaction** — the expensive memory work happens before compaction, not while you are waiting.
 
+Background work is lifecycle-bound and single-stage: observer, reflector, and dropper each
+commit their own ledger checkpoint, use independent deadlines, and retry the same watermark
+with backoff. User activity, tree changes, and shutdown abort stale work before it can append.
+Compaction never waits for the whole pipeline. It defers once only when the observer has not
+covered source history selected for removal; persistent observer failure falls back to Pi's
+native compaction instead of trapping the session.
+When pi-convergence is judging or scheduling a continuation, proactive compaction defers
+until that control work has finished.
+
 ---
 
 ## Example
@@ -213,11 +222,20 @@ A typical config:
     "observationsPoolMaxTokens": 20000,
     "observationsPoolTargetTokens": 10000,
     "agentMaxTurns": 16,
-    "model": {
+		"reflectAfterObservationTokens": 2500,
+		"reflectAfterObserverBatches": 2,
+		"observerTimeoutMs": 180000,
+		"reflectorTimeoutMs": 240000,
+		"dropperTimeoutMs": 120000,
+		"consolidationIdleDelayMs": 500,
+		"consolidationCircuitBreakerFailures": 3,
+		"consolidationCircuitBreakerMs": 900000,
+		"model": {
       "provider": "openrouter",
       "id": "google/gemma-4-31b-it",
       "thinking": "low"
-    },
+		},
+		"allowCrossProvider": false,
     "passive": false,
     "debugLog": false
   }
@@ -268,16 +286,26 @@ on the `Next compaction` line regardless of mode.
 | Setting                     | Default       | Meaning                                                                                           |
 | --------------------------- | ------------- | ------------------------------------------------------------------------------------------------- |
 | `observeAfterTokens`        | `10000`       | Raw/source token threshold for observation runs.                                                  |
-| `reflectAfterTokens`        | `20000`       | Raw/source token threshold for reflection runs; successful reflection creates dropper opportunities. |
+| `reflectAfterTokens`        | `20000`       | Legacy raw/source safety threshold for reflection runs.                                             |
+| `reflectAfterObservationTokens` | `2500`  | New active-observation token delta that makes the reflector due.                                    |
+| `reflectAfterObserverBatches` | `2`       | Committed observer batches since reflection that make the reflector due.                            |
 | `compactAfterTokens`        | `81000`       | Raw/source token threshold for proactive auto-compaction (used directly in `"calibrated"` mode, and as the fallback in `"ratio"` mode). |
 | `compactAfterTokensMode`    | `"calibrated"`| `"calibrated"` uses `compactAfterTokens` directly (default, backwards-compatible). `"ratio"` scales the threshold by the active model's `contextWindow`. |
 | `compactAfterTokensRatio`   | `0.68`        | In `"ratio"` mode, the threshold is `floor(contextWindow * ratio)`. Tunable because large windows do not always mean strong long-range attention. Must be in `(0, 1)`. |
 | `observationsPoolMaxTokens` | `20000`       | Observation-token budget used for compaction full-fold pressure.                                  |
 | `observationsPoolTargetTokens` | half of max | Active observation target used by post-reflection dropper maintenance.                            |
 | `agentMaxTurns`             | `16`          | Shared turn cap for background memory-agent loops.                                                |
+| `observerTimeoutMs`         | `180000`      | Observer stage deadline, including model resolution and background-provider queue wait.            |
+| `reflectorTimeoutMs`        | `240000`      | Reflector stage deadline.                                                                           |
+| `dropperTimeoutMs`          | `120000`      | Dropper stage deadline.                                                                             |
+| `consolidationIdleDelayMs`  | `500`         | Idle delay after `agent_end` before launching a background stage.                                   |
+| `consolidationCircuitBreakerFailures` | `3` | Consecutive failures at one watermark before opening the circuit.                                  |
+| `consolidationCircuitBreakerMs` | `900000` | Circuit-open duration after repeated failures.                                                      |
+| `compactionWaitForConsolidationMs` | `15000` | Fixed grace period for observer coverage recovery after an OM-owned proactive compaction is deferred. |
 | `model`                     | session model | Optional memory-worker model override: `{ provider, id, thinking }`.                              |
 | `passive`                   | `false`       | Disables proactive background observation, reflection, maintenance, and auto-compaction triggers. |
 | `debugLog`                  | `false`       | Writes opt-in per-session extension debug events to Pi's agent directory.                         |
+| `allowCrossProvider`        | `false`       | Explicitly permits the configured memory model to use a different provider from the active session model. |
 
 Valid `model.thinking` values are:
 
@@ -294,7 +322,7 @@ If no `model` is configured, memory workers use the session model.
 
 Dropper pruning balances age, relevance, and reflection coverage. Relevance is importance/resistance, not a permanent active-memory pin: `critical` observations require the strongest evidence but can be dropped when they are older and safely represented by reflections, superseded by newer memory, redundant, or obsolete. Dropper input annotates each active observation with deterministic coverage evidence: `none`, `partial`, or `strong`; coverage guides model judgment and is not an automatic drop rule. Dropping removes observations from active memory, not ledger history.
 
-When `debugLog` is enabled, debug events are written as local NDJSON files under Pi's agent directory. Normal sessions write to `observational-memory/debug/<session-id>.ndjson`; contexts without a session id fall back to `observational-memory/debug.ndjson`. Debug rows include `sessionId` and per-consolidation `runId`, so a session file can still be filtered to one observer/reflector/dropper run.
+When `debugLog` is enabled, debug events are written as private local NDJSON files under Pi's agent directory. Normal sessions write to `observational-memory/debug/<hashed-session-key>.ndjson`; contexts without a usable session id fall back to `observational-memory/debug.ndjson`. Rows omit the working directory and session-file path, and directories/files are forced to `0700`/`0600` permissions.
 
 For details and tuning guidance, see [`docs/configuration.md`](docs/configuration.md).
 
@@ -317,16 +345,22 @@ For details and tuning guidance, see [`docs/configuration.md`](docs/configuratio
 
 ```mermaid
 flowchart TD
-    Turn[turn_end]
+    AgentStart[agent_start]
+    Foreground[Abort background provider lease]
+    AgentEnd[agent_end plus idle delay]
+    Due{highest-priority stage due?}
     Observe[Capture observations]
     Reflect[Distill reflections]
-    AgentEnd[agent_end]
+    Drop[Prune covered observations]
     Trigger[auto-compaction trigger]
     Compact[session_before_compact]
     Summary[visible memory for Pi]
 
-    Turn -->|observation due| Observe
-    Turn -->|reflection due| Reflect
+    AgentStart --> Foreground
+    AgentEnd --> Due
+    Due -->|observer| Observe
+    Due -->|reflector| Reflect
+    Due -->|dropper| Drop
     AgentEnd -->|compactAfterTokens and idle| Trigger --> Compact --> Summary
 ```
 
@@ -349,7 +383,7 @@ Current behavior:
 * **Observation-centered memory.** The extension records useful session observations while you work.
 * **Durable reflections.** The extension distills stable facts that help the agent stay oriented over time.
 * **Fast compaction.** `session_before_compact` does not call a model or wait for background workers. It renders the current prepared memory state.
-* **Background memory work.** Observation and reflection work run from `turn_end` when their token clocks are due; dropper work runs only after successful reflection and prunes the folded active observation ledger toward `observationsPoolTargetTokens`.
+* **Background memory work.** After a successful `agent_end`, one due observer, reflector, or dropper stage acquires the shared background provider lease. Foreground work preempts it; each durable checkpoint unlocks the next stage without a monolithic pipeline.
 * **Source-backed recall.** Observations and reflections can be traced back through the `recall` tool.
 * **Visible/full views.** `/om:view` shows visible memory and `/om:view full` shows the full current memory state. Use `/om:status` for visible-vs-full drift and for the separate visible observation pool vs active observation pool.
 * **No V2 compatibility layer.** Old V2 settings and memory entries are ignored rather than migrated.

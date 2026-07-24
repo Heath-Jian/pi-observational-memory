@@ -35,6 +35,14 @@ The extension loads config once for its runtime. After changing settings, restar
     "observationsPoolMaxTokens": 20000,
     "observationsPoolTargetTokens": 10000,
     "agentMaxTurns": 16,
+		"reflectAfterObservationTokens": 2500,
+		"reflectAfterObserverBatches": 2,
+		"observerTimeoutMs": 180000,
+		"reflectorTimeoutMs": 240000,
+		"dropperTimeoutMs": 120000,
+		"consolidationIdleDelayMs": 500,
+		"consolidationCircuitBreakerFailures": 3,
+		"consolidationCircuitBreakerMs": 900000,
     "model": {
       "provider": "openrouter",
       "id": "google/gemma-4-31b-it",
@@ -53,11 +61,20 @@ You can omit everything. Defaults work for ordinary sessions, and if `model` is 
 | Setting | Type | Default | What it controls |
 |---|---:|---:|---|
 | `observeAfterTokens` | positive integer | `10000` | Raw/source token threshold for observer runs. |
-| `reflectAfterTokens` | positive integer | `20000` | Raw/source token threshold for reflector runs; successful reflection creates dropper maintenance opportunities. |
+| `reflectAfterTokens` | positive integer | `20000` | Legacy raw/source safety threshold for reflector runs. |
+| `reflectAfterObservationTokens` | positive integer | `2500` | Active observation-token delta since reflection that makes the reflector due. |
+| `reflectAfterObserverBatches` | positive integer | `2` | Committed observer batches since reflection that make the reflector due. |
 | `compactAfterTokens` | positive integer | `81000` | Raw/source token threshold for proactive auto-compaction. |
 | `observationsPoolMaxTokens` | positive integer | `20000` | Normal compaction-projection observation-token pressure that makes compaction do a full fold. |
 | `observationsPoolTargetTokens` | positive integer below max | half of `observationsPoolMaxTokens` | Folded active observation target used by post-reflection dropper maintenance. |
 | `agentMaxTurns` | positive integer | `16` | Shared nested-agent turn cap for observer, reflector, and dropper. |
+| `observerTimeoutMs` | positive integer | `180000` | Observer stage deadline, including model resolution and provider queue wait. |
+| `reflectorTimeoutMs` | positive integer | `240000` | Reflector stage deadline. |
+| `dropperTimeoutMs` | positive integer | `120000` | Dropper stage deadline. |
+| `consolidationIdleDelayMs` | positive integer | `500` | Delay after a successful `agent_end` before starting background work. |
+| `consolidationCircuitBreakerFailures` | positive integer | `3` | Same-watermark failures before the stage circuit opens. |
+| `consolidationCircuitBreakerMs` | positive integer | `900000` | Circuit-open duration. |
+| `compactionWaitForConsolidationMs` | positive integer | `15000` | Fixed grace period for observer coverage recovery after an OM-owned proactive compaction is deferred. |
 | `model` | object | unset | Optional model override for observer, reflector, and dropper. |
 | `model.provider` | string | unset | Provider name in Pi's model registry. Required when `model` is set. |
 | `model.id` | string | unset | Model id in Pi's model registry. Required when `model` is set. |
@@ -69,11 +86,19 @@ Valid `model.thinking` values are `off`, `minimal`, `low`, `medium`, `high`, and
 
 Invalid values are ignored. Positive-integer settings must be finite integers greater than zero. `observationsPoolTargetTokens` must also be below `observationsPoolMaxTokens`; if omitted or invalid, it is derived as `Math.floor(observationsPoolMaxTokens / 2)`.
 
+`compactionWaitForConsolidationMs` starts when an OM-owned proactive compaction
+is deferred for missing observer coverage. Ordinary proactive retries are
+coalesced during that fixed window; new messages do not extend it. Observer
+success retries immediately when Pi is idle. When the grace period expires, the
+next idle retry fails open to Pi native compaction if coverage is still missing.
+Native threshold/overflow compaction, passive mode, and explicit user compaction
+are never held behind this grace period.
+
 ## `observeAfterTokens`
 
 Default: `10000`.
 
-The observer runs from Pi's `turn_end` hook. It counts raw/source tokens after the latest `om.observations.recorded.data.coversUpToId` marker. When the count reaches `observeAfterTokens`, the observer receives source entries after that marker and may append a non-empty `om.observations.recorded` ledger entry.
+The observer is scheduled only after a successful `agent_end` and the configured idle delay. It counts raw/source tokens after the latest `om.observations.recorded.data.coversUpToId` marker. When the count reaches `observeAfterTokens`, the observer receives source entries after that marker and may append a non-empty `om.observations.recorded` ledger entry. A deferred compaction can force an observer below the normal threshold when uncovered source entries would otherwise be removed.
 
 Lower values create smaller chunks and more frequent model calls. Higher values reduce model-call frequency but let unobserved raw conversation accumulate longer. If the observer emits no observations, no ledger entry is written and the same range remains eligible for a later observer run.
 
@@ -81,9 +106,9 @@ Lower values create smaller chunks and more frequent model calls. Higher values 
 
 Default: `20000`.
 
-The reflector uses this raw/source-token threshold. Reflector progress is counted after the latest `om.reflections.recorded.data.coversUpToId` marker.
+Reflection normally becomes due from either `reflectAfterObservationTokens` or `reflectAfterObserverBatches`. `reflectAfterTokens` remains a raw/source safety clock for sessions whose observation metadata is sparse.
 
-The dropper no longer uses `reflectAfterTokens` as its own launch threshold. Dropper work is gated by successful reflection: after the reflector records non-empty reflections in a consolidation pass, the dropper may run if the folded active observation ledger is over `observationsPoolTargetTokens`. It can see same-turn new reflections before deciding what to prune.
+The dropper does not use `reflectAfterTokens`. It is an independent single-stage task that becomes due when committed reflections exist and the folded active observation ledger is over `observationsPoolTargetTokens`.
 
 Lower values distill reflections more often and therefore create more opportunities for post-reflection dropper maintenance. Higher values reduce reflector model calls but leave more observations between reflection and dropper opportunities.
 
@@ -109,7 +134,7 @@ This is not the active observation dropper target and not a scheduling threshold
 
 Default: half of `observationsPoolMaxTokens`.
 
-This controls the folded active observation target used by the dropper. If folded active observation tokens are at or below this target, the dropper has no maintenance work. If they are over target, the dropper can run only after the reflector records non-empty reflections in the same consolidation pass.
+This controls the folded active observation target used by the dropper. If folded active observation tokens are at or below this target, the dropper has no maintenance work. If they are over target, the dropper can run as a separate stage after at least one committed reflection is available.
 
 With the defaults, `observationsPoolMaxTokens` is `20000` and `observationsPoolTargetTokens` is `10000`. If the active observation pool reaches about `20000` tokens, the dropper computes a maximum count intended to move it back toward about `10000` tokens, but the model may drop fewer or none.
 

@@ -39,7 +39,18 @@ export interface Config {
 	observationsPoolMaxTokens: number;
 	observationsPoolTargetTokens: number;
 	agentMaxTurns: number;
+	reflectAfterObservationTokens: number;
+	reflectAfterObserverBatches: number;
+	observerTimeoutMs: number;
+	reflectorTimeoutMs: number;
+	dropperTimeoutMs: number;
+	consolidationTimeoutMs: number;
+	consolidationIdleDelayMs: number;
+	consolidationCircuitBreakerFailures: number;
+	consolidationCircuitBreakerMs: number;
+	compactionWaitForConsolidationMs: number;
 	model?: ConfiguredModel;
+	allowCrossProvider: boolean;
 	passive: boolean;
 	debugLog: boolean;
 }
@@ -53,6 +64,17 @@ export const DEFAULTS: Config = {
 	observationsPoolMaxTokens: 20_000,
 	observationsPoolTargetTokens: 10_000,
 	agentMaxTurns: 16,
+	reflectAfterObservationTokens: 2_500,
+	reflectAfterObserverBatches: 2,
+	observerTimeoutMs: 180_000,
+	reflectorTimeoutMs: 240_000,
+	dropperTimeoutMs: 120_000,
+	consolidationTimeoutMs: 120_000,
+	consolidationIdleDelayMs: 500,
+	consolidationCircuitBreakerFailures: 3,
+	consolidationCircuitBreakerMs: 15 * 60_000,
+	compactionWaitForConsolidationMs: 15_000,
+	allowCrossProvider: false,
 	passive: false,
 	debugLog: false,
 };
@@ -138,6 +160,16 @@ function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config
 		"observationsPoolMaxTokens",
 		"observationsPoolTargetTokens",
 		"agentMaxTurns",
+		"reflectAfterObservationTokens",
+		"reflectAfterObserverBatches",
+		"observerTimeoutMs",
+		"reflectorTimeoutMs",
+		"dropperTimeoutMs",
+		"consolidationTimeoutMs",
+		"consolidationIdleDelayMs",
+		"consolidationCircuitBreakerFailures",
+		"consolidationCircuitBreakerMs",
+		"compactionWaitForConsolidationMs",
 	] as const;
 	for (const key of numberKeys) {
 		const normalizedValue = positiveIntegerOrUndefined(value[key]);
@@ -149,6 +181,7 @@ function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config
 	const ratio = validRatioOrUndefined(value.compactAfterTokensRatio);
 	if (ratio !== undefined) normalized.compactAfterTokensRatio = ratio;
 	if (typeof value.passive === "boolean") normalized.passive = value.passive;
+	if (typeof value.allowCrossProvider === "boolean") normalized.allowCrossProvider = value.allowCrossProvider;
 	if (typeof value.debugLog === "boolean") normalized.debugLog = value.debugLog;
 	const model = normalizeModel(value.model);
 	if (model) normalized.model = model;

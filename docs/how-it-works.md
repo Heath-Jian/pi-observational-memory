@@ -10,8 +10,8 @@ V3 is ledger-centered: memory state is reconstructed by folding V3 ledger entrie
 
 | Surface | Purpose |
 |---|---|
-| `turn_end` observer trigger | Maybe run the observer in the background. |
-| `turn_end` reflect/drop trigger | Maybe run the due reflector, then run dropper maintenance only after same-run successful reflection. |
+| `agent_start` foreground gate | Abort background model work so it cannot compete with the active response. |
+| `agent_end` single-stage scheduler | After an idle delay, run at most one due observer, reflector, or dropper stage. |
 | `agent_end` compaction trigger | Maybe call `ctx.compact()` when idle and over `compactAfterTokens`. |
 | `session_before_compact` hook | Build the V3 compaction payload deterministically. |
 | `/om:status` | Show ledger counts, drift, progress clocks, and worker state. |
@@ -22,42 +22,47 @@ V3 is ledger-centered: memory state is reconstructed by folding V3 ledger entrie
 
 ```mermaid
 flowchart TD
-    TE[turn_end]
+    AS[agent_start]
     AE[agent_end]
     SBC[session_before_compact]
 
-    ObsDue{raw tokens since observation coverage<br/>≥ observeAfterTokens?}
-    Observer[Observer model call<br/>append om.observations.recorded]
-
-    ReflectDropDue{observer not due<br/>and reflection/drop clock due?}
-    BothDue{both due?}
-    ReflectorOnly{reflector due only?}
-    Reflector[Reflector model call<br/>append om.reflections.recorded]
-    Dropper[Dropper model call<br/>append om.observations.dropped]
+    Abort[Abort active background lease]
+    Idle[Wait for idle delay]
+    Due{Highest-priority stage due?}
+    Observer[Observer<br/>commit observation checkpoint]
+    Reflector[Reflector<br/>commit reflection checkpoint]
+    Dropper[Dropper<br/>commit drop checkpoint]
+    Backoff[Retry/backoff/circuit by watermark]
 
     CompactDue{raw tokens since compaction<br/>≥ compactAfterTokens<br/>and idle?}
     CompactCall[ctx.compact]
+    Covered{Observer covers source prefix<br/>selected for removal?}
+    Defer[Defer once and force observer]
+    Native[Pi native compaction fallback]
 
     Fold[fold/project V3 ledger]
     Render[render deterministic summary]
     Details[return om.folded details]
 
-    TE --> ObsDue
-    ObsDue -- yes --> Observer
-    ObsDue -- no --> ReflectDropDue
-    ReflectDropDue --> BothDue
-    BothDue -- yes --> Reflector --> Dropper
-    BothDue -- no --> ReflectorOnly
-    ReflectorOnly -- yes --> Reflector
-    ReflectorOnly -- no --> Dropper
+    AS --> Abort
+    AE --> Idle --> Due
+    Due -- observer --> Observer --> Idle
+    Due -- reflector --> Reflector --> Idle
+    Due -- dropper --> Dropper --> Idle
+    Observer -. failure .-> Backoff
+    Reflector -. failure .-> Backoff
+    Dropper -. failure .-> Backoff
 
     AE --> CompactDue
     CompactDue -- yes --> CompactCall
-    CompactCall --> SBC
-    SBC --> Fold --> Render --> Details
+    CompactCall --> SBC --> Covered
+    Covered -- yes --> Fold --> Render --> Details
+    Covered -- first miss --> Defer --> Idle
+    Covered -- repeated miss/failure --> Native
 ```
 
-The observer has priority. Reflect/drop does not run on a turn where observer work is due.
+The observer has priority, followed by reflector and dropper. Each stage commits separately;
+later stages are discovered from the updated ledger on a new scheduler pass.
 
 ## Source entries and progress
 
@@ -158,17 +163,17 @@ These details are what later visible projections read. The ledger remains the so
 
 ## Observer flow
 
-The observer trigger runs on `turn_end`.
+The observer trigger is evaluated after a successful `agent_end` and idle delay.
 
 1. Load config if needed.
 2. Skip if `passive` is true.
-3. Skip if `observerInFlight` is true.
+3. Skip if another consolidation stage is active or foreground work resumed.
 4. Count raw/source tokens since latest observation coverage.
 5. Skip if below `observeAfterTokens`.
 6. Select source entries after the latest observation coverage marker.
 7. Serialize those source entries for the observer prompt.
 8. Resolve the memory model.
-9. Run `runObserver()` in a background task.
+9. Acquire the shared background provider lease and run `runObserver()`.
 10. Validate source ids returned by the model.
 11. Compute deterministic 12-character ids and per-observation token counts in code.
 12. Append `om.observations.recorded` only if at least one observation was accepted.
@@ -177,22 +182,17 @@ If no observations are generated, the worker writes no entry and does not advanc
 
 ## Reflect/drop flow
 
-Reflect/drop also runs on `turn_end`, but only when the observer is not due.
+Reflector and dropper are independent single-stage tasks evaluated after observer priority.
 
 1. Load config if needed.
 2. Skip if `passive` is true.
-3. Skip if observer or reflect/drop work is already in flight.
-4. Skip if observer progress has reached `observeAfterTokens`.
-5. Check the reflector raw-token clock against `reflectAfterTokens`.
-6. Resolve the model only for stages that are ready to run.
-7. Fold current ledger state.
-8. If reflector is due and observation coverage exists, run the reflector. Each active observation line is annotated with current reflection coverage (`none`, `partial`, or `strong`) so the reflector can review uncovered durable facts without treating coverage as a quota.
-9. Append non-empty `om.reflections.recorded` with `coversUpToId` set to the latest observation coverage marker. Support ids are downstream dropper coverage evidence and should include all and only observations whose durable meaning is preserved with equivalent fidelity.
-10. Only after that same-run non-empty reflection append, check whether the folded active observation pool is over `observationsPoolTargetTokens`.
-11. If over target, run the dropper with same-turn reflections available. It computes a maximum drop count from tokens over target converted to an approximate observation count and annotates active observations with reflection coverage tiers (`none`, `partial`, `strong`) for model judgment.
-12. Append non-empty `om.observations.dropped` with `coversUpToId` set to the earlier branch position of latest observation coverage and same-run reflection coverage.
+3. Skip if another consolidation stage is active or foreground work resumed.
+4. Reflector is due when observation-token delta, observer-batch count, or the raw safety clock reaches its configured threshold.
+5. Fold current ledger state and run only the reflector. Append non-empty `om.reflections.recorded` with `coversUpToId` set to the latest observation coverage marker.
+6. On the next scheduler pass, dropper is due only when committed reflections exist and the folded active observation pool exceeds `observationsPoolTargetTokens`.
+7. Run only the dropper and append non-empty `om.observations.dropped` using committed observation and reflection coverage.
 
-Reflector no-output and reflector failure skip same-turn dropper. Dropper failure does not roll back already-appended reflections.
+No-output and failures are retryable stage failures. They do not roll back prior checkpoints and do not cause the scheduler to spin on the same watermark.
 
 ## Auto-compaction trigger
 
@@ -209,7 +209,7 @@ It skips when:
 
 When all checks pass, it calls `ctx.compact()`.
 
-This trigger does not wait for observer, reflector, or dropper promises. That is intentional: background memory work should never make compaction feel stuck.
+This trigger does not wait for reflector or dropper. The compaction hook requires only enough observer coverage to preserve source entries that will be removed.
 
 ## Compaction hook
 
@@ -219,10 +219,19 @@ It does only deterministic work:
 
 1. Guard against duplicate concurrent compaction hooks.
 2. Load config if needed.
-3. Read `event.preparation.firstKeptEntryId` and `event.preparation.tokensBefore`.
-4. Build a compaction projection from branch entries and `firstKeptEntryId`.
-5. Render a summary from projected reflections and observations.
-6. Return `{ compaction: { summary, firstKeptEntryId, tokensBefore, details } }` where `details.type` is `om.folded`.
+3. Read the current branch and `event.preparation.firstKeptEntryId`.
+4. Verify that committed observation coverage includes every source entry before the cut.
+5. If coverage is missing on an OM-owned proactive request, defer once and start
+   a boundary-scoped recovery window. Ordinary `agent_end` retries are coalesced
+   while the observer catches up.
+6. Observer success retries once when Pi is idle. Busy, queued-message, and
+   convergence states preserve and reschedule that retry instead of dropping it.
+7. If the fixed recovery grace expires, the observer circuit opens, or coverage
+   is still missing on the forced retry, fail open to Pi native compaction.
+8. Native threshold/overflow compaction, passive mode, and explicit user
+   compaction are never delayed for observer coverage.
+9. If coverage is sufficient, abort stale background work and build the projection immediately.
+10. Render and return `{ compaction: { summary, firstKeptEntryId, tokensBefore, details } }` where `details.type` is `om.folded`.
 
 It does not:
 

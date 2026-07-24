@@ -70,19 +70,19 @@ Dropping does not delete history. Dropped observations remain recallable from le
 
 ### Observer
 
-The observer runs asynchronously from `turn_end` when raw/source tokens after the latest observation coverage marker reach `observeAfterTokens`.
+The observer runs asynchronously after a successful `agent_end` and idle delay when raw/source tokens after the latest observation coverage marker reach `observeAfterTokens`. A compaction coverage gap may force it below the normal threshold.
 
 It receives raw/source entries only, validates source ids, and appends a non-empty `om.observations.recorded` entry. If there is nothing worth recording, it writes no entry and the raw range remains eligible for a later observer run.
 
 ### Reflector
 
-The reflector runs in the reflect/drop lane from `turn_end` when its raw-token clock reaches `reflectAfterTokens` and the observer is not due.
+The reflector is a separate background stage. It runs when new active observation tokens reach `reflectAfterObservationTokens`, committed observer batches reach `reflectAfterObserverBatches`, or the legacy raw-token safety clock reaches `reflectAfterTokens`.
 
 It reads active observations and current reflections, then appends durable new reflections as `om.reflections.recorded`. Reflections must cite valid supporting observation ids. The reflector's coverage annotations describe current support state only; this first coverage-stewardship model does not repair historical coverage on existing reflections that already missed a supporting observation id.
 
 ### Dropper
 
-The dropper runs only as post-reflection maintenance: after the reflector records non-empty same-turn reflections, the dropper may run if the folded active observation ledger is over `observationsPoolTargetTokens`. The dropper can see same-turn new reflections before deciding what to prune.
+The dropper is independently scheduled when committed reflections exist and the folded active observation ledger is over `observationsPoolTargetTokens`.
 
 The dropper can only drop active observation ids. It cannot rewrite or merge observations. Relevance is treated as importance/resistance rather than an absolute lock: `critical` observations are the highest-resistance candidates, but they can be dropped when the model judges that age, reflection coverage, supersession, redundancy, and semantic safety make removal from active memory safe. Its maximum drop count is computed from tokens over target converted to an approximate observation count, and the model may drop fewer or none.
 

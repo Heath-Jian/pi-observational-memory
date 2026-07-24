@@ -117,6 +117,14 @@ export type RenderableEntry = {
 	summary?: unknown;
 };
 
+const INTERNAL_CONTROL_CUSTOM_TYPES = new Set(["pi-convergence-control"]);
+
+function isInternalControlEntry(entry: RenderableEntry): boolean {
+	return entry.type === "custom_message"
+		&& typeof entry.customType === "string"
+		&& INTERNAL_CONTROL_CUSTOM_TYPES.has(entry.customType);
+}
+
 function renderCustomMessage(entry: RenderableEntry, options: { recallFormat: boolean }): string {
 	const time = options.recallFormat ? formatRecallTimestamp(entry.timestamp) : formatTimestamp(entry.timestamp);
 	const text = options.recallFormat
@@ -140,6 +148,7 @@ function renderCustomMessage(entry: RenderableEntry, options: { recallFormat: bo
 export function serializeBranchEntries(entries: RenderableEntry[]): string {
 	const blocks: string[] = [];
 	for (const entry of entries) {
+		if (isInternalControlEntry(entry)) continue;
 		if (entry.type === "message" && entry.message) {
 			const part = serializeConversation([entry.message as Message]);
 			if (part) blocks.push(part);
@@ -163,7 +172,8 @@ export type SourceAddressedSerialization = {
 };
 
 function isSourceRenderableEntry(entry: RenderableEntry): boolean {
-	return entry.type === "message" || entry.type === "custom_message" || entry.type === "branch_summary";
+	return !isInternalControlEntry(entry)
+		&& (entry.type === "message" || entry.type === "custom_message" || entry.type === "branch_summary");
 }
 
 export function serializeSourceAddressedBranchEntries(entries: RenderableEntry[]): SourceAddressedSerialization {
@@ -201,6 +211,7 @@ function renderRecallMessage(entry: RenderableEntry): string | null {
 }
 
 export function renderRecallSourceEntry(entry: RenderableEntry): string | null {
+	if (isInternalControlEntry(entry)) return null;
 	if (entry.type === "message") return renderRecallMessage(entry);
 	if (entry.type === "custom_message") return renderCustomMessage(entry, { recallFormat: true });
 	if (entry.type === "branch_summary" && typeof entry.summary === "string") {

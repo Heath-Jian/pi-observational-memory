@@ -6,6 +6,9 @@ import {
 	isSourceEntry,
 	latestCoverageIndex,
 	latestCoverageMarkerId,
+	observationCoverageIncludesCompactionPrefix,
+	observationTokensSinceReflectionCoverage,
+	observerBatchesSinceReflectionCoverage,
 	rawTokensAfterIndex,
 	rawTokensSinceDropCoverage,
 	rawTokensSinceLastCompaction,
@@ -72,6 +75,38 @@ describe("session-ledger V3 progress helpers", () => {
 		expect(rawTokensSinceObservationCoverage(entries)).toBe(9); // raw-2 + raw-3 + raw-4
 		expect(rawTokensSinceReflectionCoverage(entries)).toBe(7); // raw-3 + raw-4
 		expect(rawTokensSinceDropCoverage(entries)).toBe(7); // covers ledger entry om-eeeeeeeeeeee, raw after it
+	});
+
+	it("measures reflection progress from observation tokens and committed observer batches", () => {
+		const obsA = observation("aaaaaaaaaaaa", { sourceEntryIds: ["raw-1"], tokenCount: 5 });
+		const obsB = observation("bbbbbbbbbbbb", { sourceEntryIds: ["raw-2"], tokenCount: 7 });
+		const entries = [
+			textCustomMessage("raw-1", "aaaa"),
+			observationsRecordedEntry("om-obs-a", { observations: [obsA], coversUpToId: "raw-1" }),
+			reflectionsRecordedEntry("om-ref", { reflections: [reflection("eeeeeeeeeeee", ["aaaaaaaaaaaa"])], coversUpToId: "raw-1" }),
+			textCustomMessage("raw-2", "bbbb"),
+			observationsRecordedEntry("om-obs-b", { observations: [obsB], coversUpToId: "raw-2" }),
+		];
+
+		expect(observationTokensSinceReflectionCoverage(entries, [obsA, obsB])).toBe(7);
+		expect(observerBatchesSinceReflectionCoverage(entries)).toBe(1);
+	});
+
+	it("requires observer coverage only for source entries that compaction will remove", () => {
+		const obs = observation("aaaaaaaaaaaa", { sourceEntryIds: ["raw-1"], tokenCount: 5 });
+		const uncovered = [
+			textCustomMessage("raw-1", "aaaa"),
+			textCustomMessage("raw-2", "bbbb"),
+		];
+		const covered = [
+			...uncovered,
+			observationsRecordedEntry("om-obs", { observations: [obs], coversUpToId: "raw-1" }),
+		];
+
+		expect(observationCoverageIncludesCompactionPrefix(uncovered, "raw-2")).toBe(false);
+		expect(observationCoverageIncludesCompactionPrefix(covered, "raw-2")).toBe(true);
+		expect(observationCoverageIncludesCompactionPrefix(uncovered, "raw-1")).toBe(true);
+		expect(observationCoverageIncludesCompactionPrefix(uncovered, "missing")).toBe(true);
 	});
 
 	it("lets coversUpToId point to a memory ledger entry", () => {

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { registerCompactionHook } from "../src/hooks/compaction-hook.js";
+import { Runtime } from "../src/runtime.js";
 import {
 	compactionEntry,
 	memoryDetails,
@@ -15,27 +16,40 @@ import {
 	type TestEntry,
 } from "./fixtures/session.js";
 
-function setup(args: { entries: TestEntry[]; observationsPoolMaxTokens?: number; compactHookInFlight?: boolean }) {
-	let handler: ((event: unknown, ctx: unknown) => Promise<unknown>) | undefined;
+function setup(args: {
+	entries: TestEntry[];
+	observationsPoolMaxTokens?: number;
+	compactHookInFlight?: boolean;
+	consolidationPromise?: Promise<void> | null;
+	compactionWaitForConsolidationMs?: number;
+	activeKind?: "proactive" | "force";
+	passive?: boolean;
+}) {
+	const handlers: Record<string, ((event: any, ctx: any) => Promise<unknown> | unknown) | undefined> = {};
 	const pi = {
-		on: vi.fn((eventName: string, cb: typeof handler) => {
-			expect(eventName).toBe("session_before_compact");
-			handler = cb;
+		on: vi.fn((eventName: string, cb: (event: any, ctx: any) => Promise<unknown> | unknown) => {
+			handlers[eventName] = cb;
 		}),
+		events: { emit: vi.fn() },
 		appendEntry: vi.fn(),
 	};
-	const runtime = {
-		config: {
-			observationsPoolMaxTokens: args.observationsPoolMaxTokens ?? 20_000,
-		},
-		compactHookInFlight: args.compactHookInFlight ?? false,
-		observerPromise: new Promise(() => {}),
-		resolveModel: vi.fn(() => {
-			throw new Error("resolveModel must not be called");
-		}),
-		ensureConfig: vi.fn(),
+	const runtime = new Runtime();
+	runtime.configLoaded = true;
+	runtime.config = {
+		...runtime.config,
+		passive: args.passive ?? false,
+		observationsPoolMaxTokens: args.observationsPoolMaxTokens ?? 20_000,
+		compactionWaitForConsolidationMs: args.compactionWaitForConsolidationMs ?? 50,
 	};
+	runtime.compactHookInFlight = args.compactHookInFlight ?? false;
+	runtime.consolidationPromise = args.consolidationPromise as any ?? null;
+	vi.spyOn(runtime, "abortConsolidation");
+	vi.spyOn(runtime, "deferCompaction");
+	vi.spyOn(runtime, "clearCompactionDeferral");
+	vi.spyOn(runtime, "resolveModel");
+	if (args.activeKind) runtime.beginCompactionAttempt(args.activeKind, "root");
 	registerCompactionHook(pi as any, runtime as any);
+	const handler = handlers.session_before_compact;
 	if (!handler) throw new Error("compaction handler was not registered");
 	const ctx = {
 		cwd: "/tmp/project",
@@ -43,12 +57,17 @@ function setup(args: { entries: TestEntry[]; observationsPoolMaxTokens?: number;
 		ui: { notify: vi.fn() },
 		sessionManager: { getBranch: vi.fn(() => args.entries) },
 	};
-	const run = (firstKeptEntryId = args.entries.at(-1)?.id ?? "missing") => handler!({
+	const run = (
+		firstKeptEntryId = args.entries.at(-1)?.id ?? "missing",
+		signal?: AbortSignal,
+		reason = "manual",
+	) => handler({
 		preparation: { firstKeptEntryId, tokensBefore: 123 },
 		branchEntries: args.entries,
-		signal: undefined,
+		signal,
+		reason,
 	}, ctx);
-	return { pi, runtime, ctx, run };
+	return { pi, runtime, ctx, run, handlers };
 }
 
 describe("V3 compaction hook", () => {
@@ -154,7 +173,7 @@ describe("V3 compaction hook", () => {
 		];
 		const { run } = setup({ entries });
 
-		const result = await run("cmp-v2") as any;
+		const result = await run("raw-1") as any;
 
 		expect(result.compaction.details).toMatchObject({
 			type: "om.folded",
@@ -163,27 +182,116 @@ describe("V3 compaction hook", () => {
 		});
 	});
 
-	it("does not wait for worker promises or call model resolution", async () => {
-		const entries = [textCustomMessage("raw-1", "aaaa")];
-		const { run, runtime } = setup({ entries });
-
-		const result = await Promise.race([
-			run("raw-1"),
-			new Promise((_, reject) => setTimeout(() => reject(new Error("timed out")), 50)),
-		]);
+	it("uses committed observer coverage immediately and aborts stale background work", async () => {
+		const obs = observation("aaaaaaaaaaaa", { sourceEntryIds: ["raw-1"], tokenCount: 5 });
+		const entries = [
+			textCustomMessage("raw-1", "aaaa"),
+			observationsRecordedEntry("om-obs", { observations: [obs], coversUpToId: "raw-1" }),
+		];
+		let release: (() => void) | undefined;
+		const consolidationPromise = new Promise<void>((resolve) => { release = resolve; });
+		const { run, runtime } = setup({ entries, consolidationPromise });
+		runtime.consolidationInFlight = true;
+		let settled = false;
+		const resultPromise = run("raw-1").then((result) => {
+			settled = true;
+			return result;
+		});
+		await Promise.resolve();
+		expect(settled).toBe(true);
+		const result = await resultPromise;
 
 		expect(result).toMatchObject({ compaction: { details: { type: "om.folded" } } });
+		expect(runtime.abortConsolidation).toHaveBeenCalledWith("compaction using committed memory");
 		expect(runtime.resolveModel).not.toHaveBeenCalled();
+		release?.();
 	});
 
-	it("cancels duplicate in-flight compaction and notifies the UI", async () => {
+	it("cancels promptly when compaction is already aborted", async () => {
+		const entries = [textCustomMessage("raw-1", "aaaa")];
+		const controller = new AbortController();
+		const { run, runtime } = setup({ entries });
+
+		controller.abort();
+		await expect(run("raw-1", controller.signal)).resolves.toBeUndefined();
+		expect(runtime.compactHookInFlight).toBe(false);
+	});
+
+	it("defers once when observer coverage does not include the removal prefix", async () => {
+		const entries = [textCustomMessage("raw-1", "aaaa"), textCustomMessage("raw-2", "bbbb")];
+		const { run, runtime, ctx } = setup({ entries, activeKind: "proactive" });
+
+		await expect(run("raw-2")).resolves.toEqual({ cancel: true });
+		expect(runtime.deferCompaction).toHaveBeenCalledWith("raw-2", "root");
+		expect(runtime.compactionDeferred).toBe(true);
+		expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("deferred once"), "info");
+	});
+
+	it("falls back to Pi native compaction after the same coverage gap is deferred twice", async () => {
+		const entries = [textCustomMessage("raw-1", "aaaa"), textCustomMessage("raw-2", "bbbb")];
+		const { run, runtime, ctx } = setup({ entries, activeKind: "proactive" });
+
+		await expect(run("raw-2")).resolves.toEqual({ cancel: true });
+		await expect(run("raw-2")).resolves.toBeUndefined();
+		expect(runtime.clearCompactionDeferral).toHaveBeenCalledTimes(1);
+		expect(runtime.compactHookInFlight).toBe(false);
+		expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("Pi native compaction"), "warning");
+	});
+
+	it("falls back after one prior deferral even when Pi moves the cut", async () => {
+		const entries = [
+			textCustomMessage("raw-1", "aaaa"),
+			textCustomMessage("raw-2", "bbbb"),
+			textCustomMessage("raw-3", "cccc"),
+		];
+		const { run, runtime } = setup({ entries, activeKind: "proactive" });
+
+		await expect(run("raw-2")).resolves.toEqual({ cancel: true });
+		await expect(run("raw-3")).resolves.toBeUndefined();
+		expect(runtime.clearCompactionDeferral).toHaveBeenCalledTimes(1);
+	});
+
+	it("fails open when a duplicate compaction hook is already running", async () => {
 		const entries = [textCustomMessage("raw-1", "aaaa")];
 		const { run, ctx } = setup({ entries, compactHookInFlight: true });
 
-		await expect(run("raw-1")).resolves.toEqual({ cancel: true });
+		await expect(run("raw-1")).resolves.toBeUndefined();
 		expect(ctx.ui.notify).toHaveBeenCalledWith(
-			"Observational memory: another compaction is already in progress; cancelling duplicate",
+			"Observational memory: another compaction hook is already running; using Pi native compaction",
 			"warning",
 		);
+	});
+
+	it.each([
+		["overflow", undefined],
+		["threshold", undefined],
+		["manual", undefined],
+	] as const)("fails open for non-OM %s compaction when coverage is incomplete", async (reason) => {
+		const entries = [textCustomMessage("raw-1", "aaaa"), textCustomMessage("raw-2", "bbbb")];
+		const { run, runtime } = setup({ entries });
+
+		await expect(run("raw-2", undefined, reason)).resolves.toBeUndefined();
+		expect(runtime.compactionDeferred).toBe(false);
+	});
+
+	it("does not intercept compaction in passive mode", async () => {
+		const entries = [textCustomMessage("raw-1", "aaaa"), textCustomMessage("raw-2", "bbbb")];
+		const { run, runtime } = setup({ entries, activeKind: "proactive", passive: true });
+
+		await expect(run("raw-2")).resolves.toBeUndefined();
+		expect(runtime.compactionDeferred).toBe(false);
+	});
+
+	it("clears all compaction state after any successful session compaction", async () => {
+		const entries = [textCustomMessage("raw-1", "aaaa"), textCustomMessage("raw-2", "bbbb")];
+		const { run, runtime, handlers } = setup({ entries, activeKind: "proactive" });
+		await expect(run("raw-2")).resolves.toEqual({ cancel: true });
+		runtime.compactionCancelCooldownUntil = 123;
+
+		await handlers.session_compact?.({}, {});
+
+		expect(runtime.compactionDeferred).toBe(false);
+		expect(runtime.activeCompactionAttempt).toBeUndefined();
+		expect(runtime.compactionCancelCooldownUntil).toBe(0);
 	});
 });

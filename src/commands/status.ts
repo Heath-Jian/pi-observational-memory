@@ -6,6 +6,8 @@ import {
 	diffProjection,
 	foldLedger,
 	fullProjection,
+	observationTokensSinceReflectionCoverage,
+	observerBatchesSinceReflectionCoverage,
 	rawTokensSinceLastCompaction,
 	rawTokensSinceObservationCoverage,
 	rawTokensSinceReflectionCoverage,
@@ -61,9 +63,13 @@ export function registerStatusCommand(pi: ExtensionAPI, runtime: Runtime): void 
 			);
 			const obsProgress = rawTokensSinceObservationCoverage(entries);
 			const reflectionProgress = rawTokensSinceReflectionCoverage(entries);
+			const reflectionObservationTokens = observationTokensSinceReflectionCoverage(entries, folded.activeObservations);
+			const reflectionObserverBatches = observerBatchesSinceReflectionCoverage(entries);
 			const compactionProgress = rawTokensSinceLastCompaction(entries);
 			const contextWindow = typeof ctx.model?.contextWindow === "number" ? ctx.model.contextWindow : undefined;
 			const compactThreshold = resolveCompactAfterTokens(runtime.config, contextWindow);
+			const reflectObservationThreshold = runtime.config.reflectAfterObservationTokens ?? 2_500;
+			const reflectBatchThreshold = runtime.config.reflectAfterObserverBatches ?? 2;
 
 			const passiveLines = runtime.config.passive === true
 				? [
@@ -81,7 +87,7 @@ export function registerStatusCommand(pi: ExtensionAPI, runtime: Runtime): void 
 				"",
 				"── Activity ──",
 				`Next observation: ~${obsProgress.toLocaleString()} / ${runtime.config.observeAfterTokens.toLocaleString()} tokens (${pct(obsProgress, runtime.config.observeAfterTokens)}%)`,
-				`Next reflection:  ~${reflectionProgress.toLocaleString()} / ${runtime.config.reflectAfterTokens.toLocaleString()} tokens (${pct(reflectionProgress, runtime.config.reflectAfterTokens)}%)`,
+				`Next reflection:  ~${reflectionObservationTokens.toLocaleString()} / ${reflectObservationThreshold.toLocaleString()} observation tokens; ${reflectionObserverBatches} / ${reflectBatchThreshold} observer batches (raw safety: ${reflectionProgress.toLocaleString()} / ${runtime.config.reflectAfterTokens.toLocaleString()})`,
 				`Next compaction:  ~${compactionProgress.toLocaleString()} / ${compactThreshold.toLocaleString()} tokens (${pct(compactionProgress, compactThreshold)}%)`,
 				`Visible observation pool: ~${visibleObservationTokens.toLocaleString()} / ${runtime.config.observationsPoolMaxTokens.toLocaleString()} tokens (${pct(visibleObservationTokens, runtime.config.observationsPoolMaxTokens)}%)`,
 				`Active observation pool: ~${activeObservationPool.observationTokens.toLocaleString()} / ${runtime.config.observationsPoolTargetTokens.toLocaleString()} target tokens (${pct(activeObservationPool.observationTokens, runtime.config.observationsPoolTargetTokens)}%)`,
@@ -103,6 +109,19 @@ export function registerStatusCommand(pi: ExtensionAPI, runtime: Runtime): void 
 				if (runtime.lastObserverError) lines.push(`Observer: ${runtime.lastObserverError}`);
 				if (runtime.lastReflectorError) lines.push(`Reflector: ${runtime.lastReflectorError}`);
 				if (runtime.lastDropperError) lines.push(`Dropper: ${runtime.lastDropperError}`);
+			}
+
+			const failureStates = (["observer", "reflector", "dropper"] as const)
+				.map((phase) => [phase, runtime.stageFailureStatus(phase)] as const)
+				.filter((entry) => entry[1] !== undefined);
+			if (failureStates.length > 0 || runtime.compactionDeferred) {
+				lines.push("", "── Recovery ──");
+				for (const [phase, state] of failureStates) {
+					if (!state) continue;
+					const retryIn = Math.max(0, state.nextRetryAt - Date.now());
+					lines.push(`${phase}: ${state.failures} failure(s), retry in ~${Math.ceil(retryIn / 1000)}s${state.circuitOpenUntil ? ", circuit open" : ""}`);
+				}
+				if (runtime.compactionDeferred) lines.push(`Compaction: waiting for observer coverage (attempt ${runtime.compactionDeferralCount})`);
 			}
 
 			ctx.ui.notify(lines.join("\n"), "info");

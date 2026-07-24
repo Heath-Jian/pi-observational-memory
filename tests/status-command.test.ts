@@ -40,6 +40,9 @@ function setup(args: { entries: TestEntry[]; runtime?: Partial<any>; model?: unk
 		lastObserverError: undefined,
 		lastReflectorError: undefined,
 		lastDropperError: undefined,
+		compactionDeferred: false,
+		compactionDeferralCount: 0,
+		stageFailureStatus: vi.fn(() => undefined),
 		...args.runtime,
 	};
 	registerStatusCommand(pi as any, runtime as any);
@@ -111,7 +114,7 @@ describe("V3 /om:status", () => {
 		expect(output).toContain("Next observation:");
 		expect(output).toContain("/ 10 tokens");
 		expect(output).toContain("Next reflection:");
-		expect(output).toContain("/ 20 tokens");
+		expect(output).toContain("raw safety: 2 / 20");
 		expect(output).toContain("Next compaction:");
 		expect(output).toContain("/ 30 tokens");
 		expect(output).toContain("Visible observation pool: ~5 / 40 tokens (13%)");

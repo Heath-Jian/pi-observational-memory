@@ -4,6 +4,7 @@ import {
 	OM_OBSERVATIONS_RECORDED,
 	OM_REFLECTIONS_RECORDED,
 	type Entry,
+	type Observation,
 	type V3MemoryCustomType,
 } from "./types.js";
 
@@ -108,6 +109,43 @@ export function rawTokensSinceReflectionCoverage(entries: Entry[]): number {
 
 export function rawTokensSinceDropCoverage(entries: Entry[]): number {
 	return rawTokensSinceCoverage(entries, OM_OBSERVATIONS_DROPPED);
+}
+
+export function observationTokensSinceReflectionCoverage(entries: Entry[], observations: Observation[]): number {
+	const reflectionCoverageIndex = latestCoverageIndex(entries, OM_REFLECTIONS_RECORDED);
+	const idToIndex = entryIndexById(entries);
+	let total = 0;
+	for (const observation of observations) {
+		const isNew = observation.sourceEntryIds.some((sourceEntryId) => {
+			const sourceIndex = idToIndex.get(sourceEntryId);
+			return sourceIndex === undefined || sourceIndex > reflectionCoverageIndex;
+		});
+		if (isNew) total += observation.tokenCount;
+	}
+	return total;
+}
+
+export function observerBatchesSinceReflectionCoverage(entries: Entry[]): number {
+	const reflectionCoverageIndex = latestCoverageIndex(entries, OM_REFLECTIONS_RECORDED);
+	const idToIndex = entryIndexById(entries);
+	let batches = 0;
+	for (const entry of entries) {
+		if (!isValidCoverageEntry(entry, OM_OBSERVATIONS_RECORDED)) continue;
+		const coveredIndex = idToIndex.get(entry.data.coversUpToId);
+		if (coveredIndex !== undefined && coveredIndex > reflectionCoverageIndex) batches += 1;
+	}
+	return batches;
+}
+
+export function observationCoverageIncludesCompactionPrefix(entries: Entry[], firstKeptEntryId: string | undefined): boolean {
+	const firstKeptIndex = entryIndexForId(entries, firstKeptEntryId);
+	if (firstKeptIndex <= 0) return true;
+	let lastSourceIndexBeforeCut = -1;
+	for (let i = 0; i < firstKeptIndex; i++) {
+		if (isSourceEntry(entries[i])) lastSourceIndexBeforeCut = i;
+	}
+	if (lastSourceIndexBeforeCut === -1) return true;
+	return latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED) >= lastSourceIndexBeforeCut;
 }
 
 export function findLastCompactionIndex(entries: Entry[]): number {

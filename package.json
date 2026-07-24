@@ -1,6 +1,6 @@
 {
   "name": "pi-observational-memory",
-  "version": "3.0.3",
+	"version": "3.0.3-pi.3",
   "description": "Observational memory extension for pi — cache-friendly tiered compaction with observations and reflections.",
   "type": "module",
   "license": "MIT",
@@ -34,16 +34,16 @@
     "test": "vitest run"
   },
   "peerDependencies": {
-    "@earendil-works/pi-agent-core": "*",
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+		"@earendil-works/pi-agent-core": ">=0.81.0",
+		"@earendil-works/pi-ai": ">=0.81.0",
+		"@earendil-works/pi-coding-agent": ">=0.81.0",
+		"@earendil-works/pi-tui": ">=0.81.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-agent-core": "^0.74.0",
-    "@earendil-works/pi-ai": "^0.74.0",
-    "@earendil-works/pi-coding-agent": "^0.74.0",
-    "@earendil-works/pi-tui": "^0.74.0",
+    "@earendil-works/pi-agent-core": "^0.81.0",
+    "@earendil-works/pi-ai": "^0.81.0",
+    "@earendil-works/pi-coding-agent": "^0.81.0",
+    "@earendil-works/pi-tui": "^0.81.0",
     "@types/node": "^22.0.0",
     "typebox": "^1.1.38",
     "typescript": "^5.6.0",

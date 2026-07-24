@@ -1,31 +1,44 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { registerCompactionTrigger } from "../src/hooks/compaction-trigger.js";
+import { registerCompactionTrigger, requestCompaction } from "../src/hooks/compaction-trigger.js";
+import { Runtime } from "../src/runtime.js";
 import { compactionEntry, textCustomMessage, type TestEntry } from "./fixtures/session.js";
 
 function captureHandler(args: { compactAfterTokens?: number; compactAfterTokensMode?: "calibrated" | "ratio"; compactAfterTokensRatio?: number; passive?: boolean; compactInFlight?: boolean } = {}) {
 	let handler: ((event: unknown, ctx: unknown) => void) | undefined;
+	let convergenceHandler: ((event: unknown) => void) | undefined;
 	const pi = {
 		on: vi.fn((name: string, cb: typeof handler) => {
 			expect(name).toBe("agent_end");
 			handler = cb;
 		}),
-	};
-	const runtime = {
-		ensureConfig: vi.fn(),
-		config: {
-			compactAfterTokens: args.compactAfterTokens ?? 3,
-			compactAfterTokensMode: args.compactAfterTokensMode ?? "calibrated",
-			compactAfterTokensRatio: args.compactAfterTokensRatio ?? 0.68,
-			passive: args.passive ?? false,
+		events: {
+			on: vi.fn((name: string, cb: typeof convergenceHandler) => {
+				expect(name).toBe("pi-convergence:state");
+				convergenceHandler = cb;
+			}),
 		},
-		compactInFlight: args.compactInFlight ?? false,
-		observerPromise: new Promise(() => {}),
-		reflectDropPromise: new Promise(() => {}),
 	};
+	const runtime = new Runtime();
+	runtime.configLoaded = true;
+	runtime.config = {
+		...runtime.config,
+		compactAfterTokens: args.compactAfterTokens ?? 3,
+		compactAfterTokensMode: args.compactAfterTokensMode ?? "calibrated",
+		compactAfterTokensRatio: args.compactAfterTokensRatio ?? 0.68,
+		passive: args.passive ?? false,
+	};
+	runtime.compactInFlight = args.compactInFlight ?? false;
+	vi.spyOn(runtime, "invalidateConsolidation");
 	registerCompactionTrigger(pi as any, runtime as any);
 	if (!handler) throw new Error("agent_end handler was not registered");
-	return { handler, runtime };
+	return {
+		handler,
+		runtime,
+		convergenceState(phase: string) {
+			convergenceHandler?.({ phase });
+		},
+	};
 }
 
 function agentEnd(errorMessage?: string) {
@@ -49,6 +62,7 @@ function fakeCtx(branches: TestEntry[][], overrides: Record<string, unknown> = {
 		hasUI: true,
 		ui: { notify: vi.fn() },
 		isIdle: vi.fn(() => true),
+		hasPendingMessages: vi.fn(() => false),
 		compact: vi.fn(),
 		model: undefined,
 		...overrides,
@@ -93,6 +107,17 @@ describe("V3 compaction trigger", () => {
 		);
 	});
 
+	it("cancels deferred compaction after lifecycle generation changes", async () => {
+		const { handler, runtime } = captureHandler({ compactAfterTokens: 3 });
+		const ctx = fakeCtx([dueBranch]);
+
+		handler(agentEnd(), ctx);
+		runtime.lifecycleGeneration = 1;
+		await vi.runAllTimersAsync();
+
+		expect(ctx.compact).not.toHaveBeenCalled();
+	});
+
 	it("skips passive mode", async () => {
 		const { handler, runtime } = captureHandler({ passive: true });
 		const ctx = fakeCtx([dueBranch]);
@@ -114,6 +139,65 @@ describe("V3 compaction trigger", () => {
 
 		expect(ctx.sessionManager.getBranch).not.toHaveBeenCalled();
 		expect(ctx.compact).not.toHaveBeenCalled();
+	});
+
+	it("coalesces ordinary agent_end retries while coverage recovery is pending", async () => {
+		const { handler, runtime } = captureHandler({ compactAfterTokens: 3 });
+		runtime.deferCompaction("raw-1", "root");
+		const ctx = fakeCtx([dueBranch]);
+
+		handler(agentEnd(), ctx);
+		await vi.runAllTimersAsync();
+
+		expect(ctx.compact).not.toHaveBeenCalled();
+		expect(runtime.compactionDeferralCount).toBe(1);
+	});
+
+	it("re-checks deferred state inside the zero-delay callback", async () => {
+		const { handler, runtime } = captureHandler({ compactAfterTokens: 3 });
+		const ctx = fakeCtx([dueBranch]);
+
+		handler(agentEnd(), ctx);
+		runtime.deferCompaction("raw-1", "root");
+		await vi.runAllTimersAsync();
+
+		expect(ctx.compact).not.toHaveBeenCalled();
+		expect(runtime.compactInFlight).toBe(false);
+	});
+
+	it("drops a forced retry if another compaction changed the boundary first", async () => {
+		const { runtime } = captureHandler({ compactAfterTokens: 3 });
+		runtime.deferCompaction("raw-1", "root");
+		runtime.markCompactionReady();
+		const afterNative = [
+			...dueBranch,
+			compactionEntry("cmp-native", { firstKeptEntryId: "raw-1" }),
+			textCustomMessage("raw-2", "aaaaaaaaaaaa"),
+		];
+		const ctx = fakeCtx([dueBranch, afterNative]);
+
+		requestCompaction(runtime, ctx as any, { force: true });
+		await vi.runAllTimersAsync();
+
+		expect(ctx.compact).not.toHaveBeenCalled();
+		expect(runtime.compactionDeferred).toBe(false);
+		expect(runtime.compactInFlight).toBe(false);
+	});
+
+	it("applies cancellation cooldown only to ordinary requests and lets force bypass it", async () => {
+		const { runtime } = captureHandler({ compactAfterTokens: 3 });
+		const ordinaryCtx = fakeCtx([dueBranch]);
+		runtime.setCompactionCancelCooldown(60_000);
+		requestCompaction(runtime, ordinaryCtx as any);
+		await vi.runAllTimersAsync();
+		expect(ordinaryCtx.compact).not.toHaveBeenCalled();
+
+		runtime.deferCompaction("raw-1", "root");
+		runtime.markCompactionReady();
+		const forceCtx = fakeCtx([dueBranch]);
+		requestCompaction(runtime, forceCtx as any, { force: true });
+		await vi.runAllTimersAsync();
+		expect(forceCtx.compact).toHaveBeenCalledTimes(1);
 	});
 
 	it("skips retryable assistant errors", async () => {
@@ -151,6 +235,52 @@ describe("V3 compaction trigger", () => {
 			"Observational memory: compaction deferred — agent became busy before compaction",
 			"info",
 		);
+	});
+
+	it("defers compaction while a convergence follow-up is pending", async () => {
+		const { handler, runtime } = captureHandler({ compactAfterTokens: 3 });
+		const ctx = fakeCtx([dueBranch], { hasPendingMessages: vi.fn(() => true) });
+
+		handler(agentEnd(), ctx);
+		await vi.runAllTimersAsync();
+
+		expect(ctx.compact).not.toHaveBeenCalled();
+		expect(runtime.compactInFlight).toBe(false);
+	});
+
+	it("defers compaction while convergence is awaiting its Judge", async () => {
+		const { handler, runtime, convergenceState } = captureHandler({ compactAfterTokens: 3 });
+		const ctx = fakeCtx([dueBranch]);
+
+		handler(agentEnd(), ctx);
+		convergenceState("judging");
+		await vi.runAllTimersAsync();
+
+		expect(ctx.compact).not.toHaveBeenCalled();
+		expect(runtime.compactInFlight).toBe(false);
+	});
+
+	it("invalidates memory work when convergence reports an abort outside agent_end", () => {
+		const { runtime, convergenceState } = captureHandler({ compactAfterTokens: 3 });
+
+		convergenceState("aborted");
+
+		expect(runtime.invalidateConsolidation).toHaveBeenCalledTimes(1);
+	});
+
+	it("never compacts an explicitly aborted run", async () => {
+		const { handler, runtime } = captureHandler({ compactAfterTokens: 3 });
+		const ctx = fakeCtx([dueBranch]);
+
+		handler({
+			type: "agent_end",
+			messages: [{ role: "assistant", content: [], stopReason: "aborted" }],
+		}, ctx);
+		await vi.runAllTimersAsync();
+
+		expect(runtime.compactInFlight).toBe(false);
+		expect(ctx.sessionManager.getBranch).not.toHaveBeenCalled();
+		expect(ctx.compact).not.toHaveBeenCalled();
 	});
 
 	it("re-checks threshold after deferral and skips if another compaction already reduced pressure", async () => {
