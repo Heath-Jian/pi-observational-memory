@@ -41,6 +41,7 @@ describe("V3 config", () => {
 			compactAfterTokens: 81000,
 			compactAfterTokensMode: "calibrated",
 			compactAfterTokensRatio: 0.68,
+			compactAfterTokensOverrides: [],
 			observationsPoolMaxTokens: 20000,
 			observationsPoolTargetTokens: 10000,
 			agentMaxTurns: 16,
@@ -290,6 +291,92 @@ describe("V3 config", () => {
 			expect(resolveCompactAfterTokens(config, undefined)).toBe(81000);
 			expect(resolveCompactAfterTokens(config, 0)).toBe(81000);
 			expect(resolveCompactAfterTokens(config, -1)).toBe(81000);
+		});
+	});
+
+	describe("compactAfterTokensOverrides", () => {
+		it("parses valid overrides from settings", () => {
+			writeJson(join(agentDir, "settings.json"), {
+				"observational-memory": {
+					compactAfterTokensOverrides: [
+						{ provider: "kimi-coding", compactAfterTokens: 80000 },
+						{ provider: "ark", model: "glm-5.2", compactAfterTokensRatio: 0.2 },
+					],
+				},
+			});
+			expect(loadConfig(cwd, {}).compactAfterTokensOverrides).toEqual([
+				{ provider: "kimi-coding", compactAfterTokens: 80000 },
+				{ provider: "ark", model: "glm-5.2", compactAfterTokensRatio: 0.2 },
+			]);
+		});
+
+		it("drops entries without a provider/model selector or without a threshold", () => {
+			writeJson(join(agentDir, "settings.json"), {
+				"observational-memory": {
+					compactAfterTokensOverrides: [
+						{ compactAfterTokens: 80000 },
+						{ provider: "kimi-coding" },
+						{ provider: "", compactAfterTokens: 80000 },
+						"nonsense",
+						{ model: "k3", compactAfterTokensRatio: 1.5 },
+						{ provider: "kimi-coding", compactAfterTokens: 80000 },
+					],
+				},
+			});
+			expect(loadConfig(cwd, {}).compactAfterTokensOverrides).toEqual([
+				{ provider: "kimi-coding", compactAfterTokens: 80000 },
+			]);
+		});
+
+		it("defaults to an empty override list", () => {
+			expect(loadConfig(cwd, {}).compactAfterTokensOverrides).toEqual([]);
+		});
+
+		it("applies a matching provider override with a fixed threshold", () => {
+			const config = {
+				...DEFAULTS,
+				compactAfterTokensMode: "ratio",
+				compactAfterTokensRatio: 0.45,
+				compactAfterTokensOverrides: [{ provider: "kimi-coding", compactAfterTokens: 80000 }],
+			} as any;
+			expect(resolveCompactAfterTokens(config, 1_000_000, { provider: "kimi-coding", id: "k3" })).toBe(80000);
+			expect(resolveCompactAfterTokens(config, 1_000_000, { provider: "ark", id: "glm-5.2" })).toBe(450000);
+			expect(resolveCompactAfterTokens(config, 1_000_000)).toBe(450000);
+		});
+
+		it("requires both provider and model to match when both are specified", () => {
+			const config = {
+				...DEFAULTS,
+				compactAfterTokensMode: "calibrated",
+				compactAfterTokens: 81000,
+				compactAfterTokensOverrides: [{ provider: "ark", model: "glm-5.2", compactAfterTokens: 50000 }],
+			} as any;
+			expect(resolveCompactAfterTokens(config, 256000, { provider: "ark", id: "glm-5.2" })).toBe(50000);
+			expect(resolveCompactAfterTokens(config, 256000, { provider: "ark", id: "deepseek-v4-pro" })).toBe(81000);
+			expect(resolveCompactAfterTokens(config, 256000, { provider: "kimi-coding", id: "glm-5.2" })).toBe(81000);
+		});
+
+		it("supports model-only overrides and override ratios", () => {
+			const config = {
+				...DEFAULTS,
+				compactAfterTokensMode: "calibrated",
+				compactAfterTokens: 81000,
+				compactAfterTokensOverrides: [{ model: "k3", compactAfterTokensRatio: 0.1 }],
+			} as any;
+			expect(resolveCompactAfterTokens(config, 1_000_000, { provider: "kimi-coding", id: "k3" })).toBe(100000);
+			// window unavailable: override ratio unusable, base calibrated applies
+			expect(resolveCompactAfterTokens(config, undefined, { provider: "kimi-coding", id: "k3" })).toBe(81000);
+		});
+
+		it("uses the first matching override", () => {
+			const config = {
+				...DEFAULTS,
+				compactAfterTokensOverrides: [
+					{ provider: "kimi-coding", compactAfterTokens: 70000 },
+					{ provider: "kimi-coding", compactAfterTokens: 90000 },
+				],
+			} as any;
+			expect(resolveCompactAfterTokens(config, 1_000_000, { provider: "kimi-coding", id: "k3" })).toBe(70000);
 		});
 	});
 });

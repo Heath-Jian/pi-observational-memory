@@ -67,7 +67,14 @@ export function registerStatusCommand(pi: ExtensionAPI, runtime: Runtime): void 
 			const reflectionObserverBatches = observerBatchesSinceReflectionCoverage(entries);
 			const compactionProgress = rawTokensSinceLastCompaction(entries);
 			const contextWindow = typeof ctx.model?.contextWindow === "number" ? ctx.model.contextWindow : undefined;
-			const compactThreshold = resolveCompactAfterTokens(runtime.config, contextWindow);
+			const compactThreshold = resolveCompactAfterTokens(runtime.config, contextWindow, {
+				provider: typeof (ctx.model as { provider?: unknown } | undefined)?.provider === "string"
+					? (ctx.model as { provider: string }).provider
+					: undefined,
+				id: typeof (ctx.model as { id?: unknown } | undefined)?.id === "string"
+					? (ctx.model as { id: string }).id
+					: undefined,
+			});
 			const reflectObservationThreshold = runtime.config.reflectAfterObservationTokens ?? 2_500;
 			const reflectBatchThreshold = runtime.config.reflectAfterObserverBatches ?? 2;
 

@@ -12,7 +12,7 @@ type CompactionCtx = {
 	cwd: string;
 	hasUI: boolean;
 	ui?: { notify: (message: string, type?: "warning" | "info" | "error") => void };
-	model?: { contextWindow?: number };
+	model?: { contextWindow?: number; provider?: string; id?: string };
 	isIdle: () => boolean;
 	hasPendingMessages?: () => boolean;
 	compact: (options: {
@@ -31,7 +31,11 @@ function latestCompactionBoundaryKey(entries: Entry[]): string {
 
 function compactionThreshold(runtime: Runtime, ctx: CompactionCtx): number {
 	const contextWindow = typeof ctx.model?.contextWindow === "number" ? ctx.model.contextWindow : undefined;
-	return resolveCompactAfterTokens(runtime.config, contextWindow);
+	const model = {
+		provider: typeof ctx.model?.provider === "string" ? ctx.model.provider : undefined,
+		id: typeof ctx.model?.id === "string" ? ctx.model.id : undefined,
+	};
+	return resolveCompactAfterTokens(runtime.config, contextWindow, model);
 }
 
 export function requestCompaction(

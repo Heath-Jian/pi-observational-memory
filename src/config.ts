@@ -30,12 +30,37 @@ export interface ConfiguredModel {
  */
 export type CompactAfterTokensMode = "calibrated" | "ratio";
 
+/**
+ * Per-provider/per-model compaction threshold override.
+ *
+ * Resolution order in `resolveCompactAfterTokens`:
+ * 1. First override whose `provider` (if set) matches the active model's
+ *    provider AND whose `model` (if set) matches the active model's id wins.
+ * 2. A winning override with `compactAfterTokens` returns that fixed value.
+ * 3. A winning override with only `compactAfterTokensRatio` scales by the
+ *    active model's context window; when the window is unavailable the
+ *    override is skipped and base resolution applies.
+ * 4. No matching override: base `compactAfterTokensMode` logic applies.
+ *
+ * Use this when a specific provider enforces rate limits that make large
+ * contexts expensive (e.g. a 1M-window model whose backend throttles long
+ * requests): compact earlier only for that provider without lowering the
+ * threshold for every other model.
+ */
+export interface CompactAfterTokensOverride {
+	provider?: string;
+	model?: string;
+	compactAfterTokens?: number;
+	compactAfterTokensRatio?: number;
+}
+
 export interface Config {
 	observeAfterTokens: number;
 	reflectAfterTokens: number;
 	compactAfterTokens: number;
 	compactAfterTokensMode: CompactAfterTokensMode;
 	compactAfterTokensRatio: number;
+	compactAfterTokensOverrides: CompactAfterTokensOverride[];
 	observationsPoolMaxTokens: number;
 	observationsPoolTargetTokens: number;
 	agentMaxTurns: number;
@@ -62,6 +87,7 @@ export const DEFAULTS: Config = {
 	compactAfterTokens: 81_000,
 	compactAfterTokensMode: "calibrated",
 	compactAfterTokensRatio: 0.68,
+	compactAfterTokensOverrides: [],
 	observationsPoolMaxTokens: 20_000,
 	observationsPoolTargetTokens: 10_000,
 	agentMaxTurns: 16,
@@ -92,8 +118,27 @@ export const COMPACT_AFTER_TOKENS_MODE_VALUES: readonly CompactAfterTokensMode[]
  * In `"ratio"` mode this is `floor(contextWindow * compactAfterTokensRatio)`
  * (clamped to a minimum of 1) when `contextWindow` is a positive number, and
  * falls back to `config.compactAfterTokens` otherwise.
+ *
+ * Before the base mode is consulted, `config.compactAfterTokensOverrides` is
+ * checked against the active model (see {@link CompactAfterTokensOverride}).
  */
-export function resolveCompactAfterTokens(config: Config, contextWindow: number | undefined): number {
+export function resolveCompactAfterTokens(
+	config: Config,
+	contextWindow: number | undefined,
+	model?: { provider?: string; id?: string },
+): number {
+	for (const override of config.compactAfterTokensOverrides ?? []) {
+		if (override.provider !== undefined && override.provider !== model?.provider) continue;
+		if (override.model !== undefined && override.model !== model?.id) continue;
+		if (override.compactAfterTokens !== undefined) return override.compactAfterTokens;
+		if (
+			override.compactAfterTokensRatio !== undefined
+			&& typeof contextWindow === "number"
+			&& contextWindow > 0
+		) {
+			return Math.max(1, Math.floor(contextWindow * override.compactAfterTokensRatio));
+		}
+	}
 	if (config.compactAfterTokensMode === "ratio" && typeof contextWindow === "number" && contextWindow > 0) {
 		return Math.max(1, Math.floor(contextWindow * config.compactAfterTokensRatio));
 	}
@@ -143,6 +188,22 @@ function nonEmptyString(value: unknown): string | undefined {
 	return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
+function normalizeCompactAfterTokensOverride(value: unknown): CompactAfterTokensOverride | undefined {
+	if (!isRecord(value)) return undefined;
+	const provider = nonEmptyString(value.provider);
+	const model = nonEmptyString(value.model);
+	if (!provider && !model) return undefined;
+	const compactAfterTokens = positiveIntegerOrUndefined(value.compactAfterTokens);
+	const compactAfterTokensRatio = validRatioOrUndefined(value.compactAfterTokensRatio);
+	if (compactAfterTokens === undefined && compactAfterTokensRatio === undefined) return undefined;
+	const override: CompactAfterTokensOverride = {};
+	if (provider) override.provider = provider;
+	if (model) override.model = model;
+	if (compactAfterTokens !== undefined) override.compactAfterTokens = compactAfterTokens;
+	if (compactAfterTokensRatio !== undefined) override.compactAfterTokensRatio = compactAfterTokensRatio;
+	return override;
+}
+
 function normalizeModel(value: unknown): ConfiguredModel | undefined {
 	if (!isRecord(value)) return undefined;
 	const provider = nonEmptyString(value.provider);
@@ -182,6 +243,11 @@ function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config
 	}
 	const ratio = validRatioOrUndefined(value.compactAfterTokensRatio);
 	if (ratio !== undefined) normalized.compactAfterTokensRatio = ratio;
+	if (Array.isArray(value.compactAfterTokensOverrides)) {
+		normalized.compactAfterTokensOverrides = value.compactAfterTokensOverrides
+			.map(normalizeCompactAfterTokensOverride)
+			.filter((override): override is CompactAfterTokensOverride => override !== undefined);
+	}
 	if (typeof value.showWorkerNotifications === "boolean") normalized.showWorkerNotifications = value.showWorkerNotifications;
 	if (typeof value.passive === "boolean") normalized.passive = value.passive;
 	if (typeof value.allowCrossProvider === "boolean") normalized.allowCrossProvider = value.allowCrossProvider;
