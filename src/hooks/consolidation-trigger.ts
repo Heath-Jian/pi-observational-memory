@@ -120,6 +120,10 @@ function debugSessionMetadata(ctx: ConsolidationCtx): { sessionId?: string } {
 	}
 }
 
+function shouldNotifyWorker(runtime: Runtime, ctx: ConsolidationCtx): boolean {
+	return runtime.config.showWorkerNotifications && ctx.hasUI;
+}
+
 function isRunCurrent(runtime: Runtime, ctx: ConsolidationCtx, run: ConsolidationRun): boolean {
 	if (run.signal.aborted || !runtime.isConsolidationCurrent(run.generation)) return false;
 	if (!run.sessionId) return true;
@@ -388,7 +392,7 @@ async function runObserverStage(
 	if (!chunk.trim() || sourceEntryIds.length === 0) return true;
 
 	const memory = fullProjection(entries);
-	if (ctx.hasUI) ctx.ui?.notify(`Observational memory: observer running on ~${tokens.toLocaleString()}-token chunk`, "info");
+	if (shouldNotifyWorker(runtime, ctx)) ctx.ui?.notify(`Observational memory: observer running on ~${tokens.toLocaleString()}-token chunk`, "info");
 	debugLog("observer.start", { tokens, coversUpToId, sourceEntryCount: sourceEntryIds.length });
 	const resolved = await resolveModel("observer");
 	if (!resolved || !isRunCurrent(runtime, ctx, run)) return false;
@@ -408,7 +412,7 @@ async function runObserverStage(
 	const data = buildObservationsRecordedData(observations, coversUpToId);
 	if (!data) return false;
 	appendEntry(pi, OM_OBSERVATIONS_RECORDED, data);
-	if (ctx.hasUI) ctx.ui?.notify(`Observational memory: ${observations.length} observation${observations.length === 1 ? "" : "s"} recorded`, "info");
+	if (shouldNotifyWorker(runtime, ctx)) ctx.ui?.notify(`Observational memory: ${observations.length} observation${observations.length === 1 ? "" : "s"} recorded`, "info");
 	return true;
 }
 
@@ -423,7 +427,7 @@ async function runReflectorStage(
 	const observationCoverageId = latestCoverageMarkerId(entries, OM_OBSERVATIONS_RECORDED);
 	if (!observationCoverageId) return true;
 	const folded = foldLedger(entries);
-	if (ctx.hasUI) ctx.ui?.notify(
+	if (shouldNotifyWorker(runtime, ctx)) ctx.ui?.notify(
 		`Observational memory: reflector running on ${folded.activeObservations.length.toLocaleString()} active observations`,
 		"info",
 	);
@@ -460,7 +464,7 @@ async function runDropperStage(
 	const folded = foldLedger(entries);
 	const metrics = observationPoolMetrics(folded.activeObservations, runtime.config.observationsPoolTargetTokens);
 	if (!metrics.ready) return true;
-	if (ctx.hasUI) ctx.ui?.notify(
+	if (shouldNotifyWorker(runtime, ctx)) ctx.ui?.notify(
 		`Observational memory: dropper running — active observation pool ~${metrics.observationTokens.toLocaleString()} / ${metrics.targetTokens.toLocaleString()} target tokens`,
 		"info",
 	);

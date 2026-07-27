@@ -47,6 +47,7 @@ function setup(args: {
 	observationsPoolTargetTokens?: number;
 	compactAfterTokens?: number;
 	compactionWaitForConsolidationMs?: number;
+	showWorkerNotifications?: boolean;
 }) {
 	let entries = [...args.entries];
 	const handlers: Record<string, ((event: any, ctx: any) => void) | undefined> = {};
@@ -79,6 +80,7 @@ function setup(args: {
 	runtime.configLoaded = true;
 	runtime.config = {
 		...runtime.config,
+		showWorkerNotifications: args.showWorkerNotifications ?? true,
 		passive: args.passive ?? false,
 		debugLog: false,
 		observeAfterTokens: args.observeAfterTokens ?? 1,
@@ -141,6 +143,18 @@ describe("single-stage consolidation scheduler", () => {
 		subject.fireAgentEnd();
 		await subject.advance();
 		await vi.waitFor(() => expect(mockAgents.runObserver).toHaveBeenCalledTimes(1));
+	});
+
+	it("suppresses worker notifications when showWorkerNotifications is false", async () => {
+		mockAgents.runObserver.mockResolvedValueOnce([obsA]);
+		const quiet = setup({ entries: [textCustomMessage("raw-1", "aaaaaaaa")], showWorkerNotifications: false });
+		quiet.fireAgentEnd();
+		await quiet.advance();
+		await vi.waitFor(() => expect(quiet.pi.appendEntry).toHaveBeenCalledWith(
+			OM_OBSERVATIONS_RECORDED,
+			{ observations: [obsA], coversUpToId: "raw-1" },
+		));
+		expect(quiet.ctx.ui.notify).not.toHaveBeenCalled();
 	});
 
 	it("runs observer as one durable stage", async () => {

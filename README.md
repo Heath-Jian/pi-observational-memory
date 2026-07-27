@@ -236,7 +236,8 @@ A typical config:
       "thinking": "low"
 		},
 		"allowCrossProvider": false,
-    "passive": false,
+		"showWorkerNotifications": true,
+		"passive": false,
     "debugLog": false
   }
 }
@@ -303,6 +304,7 @@ on the `Next compaction` line regardless of mode.
 | `consolidationCircuitBreakerMs` | `900000` | Circuit-open duration after repeated failures.                                                      |
 | `compactionWaitForConsolidationMs` | `15000` | Fixed grace period for observer coverage recovery after an OM-owned proactive compaction is deferred. |
 | `model`                     | session model | Optional memory-worker model override: `{ provider, id, thinking }`.                              |
+| `showWorkerNotifications`   | `true`        | Shows routine observer, reflector, and dropper progress notifications. Warnings and errors are unaffected. |
 | `passive`                   | `false`       | Disables proactive background observation, reflection, maintenance, and auto-compaction triggers. |
 | `debugLog`                  | `false`       | Writes opt-in per-session extension debug events to Pi's agent directory.                         |
 | `allowCrossProvider`        | `false`       | Explicitly permits the configured memory model to use a different provider from the active session model. |
@@ -317,6 +319,8 @@ Valid `model.thinking` values are:
 * `xhigh`
 
 If no `model` is configured, memory workers use the session model.
+
+Set `showWorkerNotifications` to `false` to hide routine worker start and completion messages. Model fallback/unavailability, no-output warnings, worker failures, compaction notifications, and explicit `/om:*` command output remain visible.
 
 `observationsPoolMaxTokens` and `observationsPoolTargetTokens` intentionally describe different pools. Max tokens control when compaction performs a full fold over visible memory. Target tokens control the folded active observation pool that the dropper maintains after successful reflection. If the target is omitted, it defaults to half of max.
 

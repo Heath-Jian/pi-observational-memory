@@ -48,6 +48,7 @@ The extension loads config once for its runtime. After changing settings, restar
       "id": "google/gemma-4-31b-it",
       "thinking": "low"
     },
+    "showWorkerNotifications": true,
     "passive": false,
     "debugLog": false
   }
@@ -79,6 +80,7 @@ You can omit everything. Defaults work for ordinary sessions, and if `model` is 
 | `model.provider` | string | unset | Provider name in Pi's model registry. Required when `model` is set. |
 | `model.id` | string | unset | Model id in Pi's model registry. Required when `model` is set. |
 | `model.thinking` | enum | unset; workers fall back to `low` | Optional reasoning/thinking level for memory workers. |
+| `showWorkerNotifications` | boolean | `true` | Shows routine observer, reflector, and dropper progress notifications. |
 | `passive` | boolean | `false` | Disables proactive background memory and auto-compaction triggers. |
 | `debugLog` | boolean | `false` | Writes best-effort per-session extension debug events to Pi's agent directory. |
 
@@ -171,6 +173,12 @@ Set `model` when you want the observer, reflector, and dropper to use a cheaper 
 ```
 
 `provider` and `id` must both be non-empty strings. `thinking` is optional. If the configured model cannot be resolved, the runtime attempts to fall back to the current session model and notifies once. If no usable model or API key is available, the relevant background worker skips/fails safely rather than inventing memory.
+
+## `showWorkerNotifications`
+
+Default: `true`.
+
+When `false`, the extension hides routine observer, reflector, and dropper progress notifications. Model fallback/unavailability, no-output warnings, worker failures, compaction notifications, and explicit `/om:*` command output remain visible.
 
 ## `passive`
 

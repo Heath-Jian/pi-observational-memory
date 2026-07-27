@@ -51,6 +51,7 @@ export interface Config {
 	compactionWaitForConsolidationMs: number;
 	model?: ConfiguredModel;
 	allowCrossProvider: boolean;
+	showWorkerNotifications: boolean;
 	passive: boolean;
 	debugLog: boolean;
 }
@@ -75,6 +76,7 @@ export const DEFAULTS: Config = {
 	consolidationCircuitBreakerMs: 15 * 60_000,
 	compactionWaitForConsolidationMs: 15_000,
 	allowCrossProvider: false,
+	showWorkerNotifications: true,
 	passive: false,
 	debugLog: false,
 };
@@ -180,6 +182,7 @@ function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config
 	}
 	const ratio = validRatioOrUndefined(value.compactAfterTokensRatio);
 	if (ratio !== undefined) normalized.compactAfterTokensRatio = ratio;
+	if (typeof value.showWorkerNotifications === "boolean") normalized.showWorkerNotifications = value.showWorkerNotifications;
 	if (typeof value.passive === "boolean") normalized.passive = value.passive;
 	if (typeof value.allowCrossProvider === "boolean") normalized.allowCrossProvider = value.allowCrossProvider;
 	if (typeof value.debugLog === "boolean") normalized.debugLog = value.debugLog;

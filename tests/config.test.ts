@@ -55,6 +55,7 @@ describe("V3 config", () => {
 			consolidationCircuitBreakerMs: 900000,
 			compactionWaitForConsolidationMs: 15000,
 			allowCrossProvider: false,
+			showWorkerNotifications: true,
 			passive: false,
 			debugLog: false,
 		});
@@ -82,6 +83,7 @@ describe("V3 config", () => {
 				compactionWaitForConsolidationMs: 25,
 				model: { provider: "anthropic", id: "global", thinking: "medium" },
 				allowCrossProvider: true,
+				showWorkerNotifications: true,
 				passive: false,
 				debugLog: true,
 			},
@@ -90,6 +92,7 @@ describe("V3 config", () => {
 			"observational-memory": {
 				observeAfterTokens: 100,
 				model: { provider: "openai", id: "project", thinking: "low" },
+				showWorkerNotifications: false,
 			},
 		});
 
@@ -112,6 +115,7 @@ describe("V3 config", () => {
 			compactionWaitForConsolidationMs: 25,
 			model: { provider: "openai", id: "project", thinking: "low" },
 			allowCrossProvider: true,
+			showWorkerNotifications: false,
 			passive: true,
 			debugLog: true,
 		});
@@ -127,6 +131,7 @@ describe("V3 config", () => {
 				observationsPoolTargetTokens: "10000",
 				agentMaxTurns: null,
 				model: { provider: "anthropic", id: "", thinking: "huge" },
+				showWorkerNotifications: "no",
 				passive: "yes",
 				debugLog: "true",
 			},
