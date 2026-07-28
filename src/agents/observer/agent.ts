@@ -10,7 +10,7 @@ import { nowTimestamp, truncateRecordContent } from "../../serialize.js";
 import type { Observation, Relevance } from "../../session-ledger/index.js";
 import { estimateStringTokens } from "../../tokens.js";
 
-interface RunObserverArgs {
+export interface RunObserverArgs {
 	model: Model<any>;
 	apiKey: string;
 	headers?: Record<string, string>;
@@ -22,6 +22,23 @@ interface RunObserverArgs {
 	agentLoop?: typeof agentLoop;
 	maxTurns?: number;
 	thinkingLevel?: ModelThinkingLevel;
+	/** Optional response cap used only by config-gated bounded observer runs. */
+	maxOutputTokens?: number;
+}
+
+export interface ObserverRunStats {
+	toolCalls: number;
+	added: number;
+	duplicate: number;
+	rejected: number;
+	stopReason: string;
+}
+
+export interface ObserverRunResult {
+	observations: Observation[];
+	stats: ObserverRunStats;
+	/** Best-effort signal from a normally completed final assistant turn. */
+	covered?: boolean;
 }
 
 const RelevanceSchema = Type.Union([
@@ -61,8 +78,81 @@ const RecordObservationsSchema = Type.Object({
 
 type RecordObservationsArgs = Static<typeof RecordObservationsSchema>;
 
+const RECORD_OBSERVATIONS_DESCRIPTION =
+	"Record a batch of new observations distilled from the conversation chunk. " +
+	"Call this multiple times as you work through the chunk. Stop calling when coverage is complete, " +
+	"then emit a short plain-text confirmation to end the run.";
+
 function joinOrEmpty(items: string[]): string {
 	return items.length ? items.join("\n") : "(none yet)";
+}
+
+export function buildObserverUserText(args: {
+	priorReflections: string[];
+	priorObservations: string[];
+	chunk: string;
+	now?: string;
+}): string {
+	const conversation = args.chunk.trim();
+	return `Current local time: ${args.now ?? nowTimestamp()}
+
+CURRENT REFLECTIONS:
+${joinOrEmpty(args.priorReflections)}
+
+CURRENT OBSERVATIONS:
+${joinOrEmpty(args.priorObservations)}
+
+Compress the following new conversation chunk into observations by calling record_observations one or more times. Do not restate facts already present in current reflections or current observations. Prefer inline conversation timestamps when assigning times; fall back to the current local time above only if no message timestamp applies. Stop calling the tool and reply with a short plain-text confirmation once the chunk is fully covered.
+
+NEW CONVERSATION CHUNK:
+${conversation}`;
+}
+
+/**
+ * Estimate the complete observer input, including the system/user templates and
+ * the record_observations tool declaration. The caller applies an additional
+ * safety factor before comparing this estimate with a configured hard budget.
+ */
+const OBSERVER_TOOL_DECLARATION = JSON.stringify({
+	name: "record_observations",
+	description: RECORD_OBSERVATIONS_DESCRIPTION,
+	parameters: RecordObservationsSchema,
+});
+
+export function estimateObserverPromptTokensForChunkCharacters(args: {
+	priorReflections: string[];
+	priorObservations: string[];
+	chunkCharacters: number;
+}): { promptTokens: number; priorMemoryTokens: number } {
+	const priorMemoryTokens = (args.priorReflections.length > 0
+		? estimateStringTokens(args.priorReflections.join("\n"))
+		: 0)
+		+ (args.priorObservations.length > 0
+			? estimateStringTokens(args.priorObservations.join("\n"))
+			: 0);
+	const emptyChunkUserText = buildObserverUserText({
+		priorReflections: args.priorReflections,
+		priorObservations: args.priorObservations,
+		chunk: "",
+	});
+	return {
+		promptTokens: estimateStringTokens(OBSERVER_SYSTEM)
+			+ Math.ceil((emptyChunkUserText.length + Math.max(0, args.chunkCharacters)) / 4)
+			+ estimateStringTokens(OBSERVER_TOOL_DECLARATION),
+		priorMemoryTokens,
+	};
+}
+
+export function estimateObserverPromptTokens(args: {
+	priorReflections: string[];
+	priorObservations: string[];
+	chunk: string;
+}): { promptTokens: number; priorMemoryTokens: number } {
+	return estimateObserverPromptTokensForChunkCharacters({
+		priorReflections: args.priorReflections,
+		priorObservations: args.priorObservations,
+		chunkCharacters: args.chunk.trim().length,
+	});
 }
 
 export function normalizeSourceEntryIds(
@@ -82,22 +172,30 @@ export function normalizeSourceEntryIds(
 	return Array.from(seen).sort((a, b) => (allowedOrder.get(a) ?? 0) - (allowedOrder.get(b) ?? 0));
 }
 
-export async function runObserver(args: RunObserverArgs): Promise<Observation[] | undefined> {
+export async function runObserver(args: RunObserverArgs): Promise<ObserverRunResult> {
 	const { model, apiKey, headers, priorReflections, priorObservations, chunk, allowedSourceEntryIds, signal } = args;
 	const conversation = chunk.trim();
-	if (!conversation) return undefined;
+	if (!conversation) {
+		return {
+			observations: [],
+			stats: { toolCalls: 0, added: 0, duplicate: 0, rejected: 0, stopReason: "empty-input" },
+			covered: false,
+		};
+	}
 
 	const accumulated = new Map<string, Observation>();
+	let toolCalls = 0;
+	let totalAdded = 0;
+	let totalDuplicates = 0;
+	let totalRejected = 0;
 
 	const recordObservations: AgentTool<typeof RecordObservationsSchema> = {
 		name: "record_observations",
 		label: "Record observations",
-		description:
-			"Record a batch of new observations distilled from the conversation chunk. " +
-			"Call this multiple times as you work through the chunk. Stop calling when coverage is complete, " +
-			"then emit a short plain-text confirmation to end the run.",
+		description: RECORD_OBSERVATIONS_DESCRIPTION,
 		parameters: RecordObservationsSchema,
 		execute: async (_id, params: RecordObservationsArgs) => {
+			toolCalls++;
 			let added = 0;
 			let duplicates = 0;
 			let rejected = 0;
@@ -123,6 +221,9 @@ export async function runObserver(args: RunObserverArgs): Promise<Observation[] 
 				});
 				added++;
 			}
+			totalAdded += added;
+			totalDuplicates += duplicates;
+			totalRejected += rejected;
 			const rejectedPart = rejected > 0
 				? ` ${rejected} observation${rejected === 1 ? "" : "s"} rejected for missing or invalid sourceEntryIds.`
 				: "";
@@ -136,19 +237,7 @@ export async function runObserver(args: RunObserverArgs): Promise<Observation[] 
 		},
 	};
 
-	const now = nowTimestamp();
-	const userText = `Current local time: ${now}
-
-CURRENT REFLECTIONS:
-${joinOrEmpty(priorReflections)}
-
-CURRENT OBSERVATIONS:
-${joinOrEmpty(priorObservations)}
-
-Compress the following new conversation chunk into observations by calling record_observations one or more times. Do not restate facts already present in current reflections or current observations. Prefer inline conversation timestamps when assigning times; fall back to the current local time above only if no message timestamp applies. Stop calling the tool and reply with a short plain-text confirmation once the chunk is fully covered.
-
-NEW CONVERSATION CHUNK:
-${conversation}`;
+	const userText = buildObserverUserText({ priorReflections, priorObservations, chunk: conversation });
 
 	const prompts: Message[] = [
 		{
@@ -168,11 +257,15 @@ ${conversation}`;
 	const thinkingLevel = args.thinkingLevel ?? "low";
 	const effectiveMaxTurns = args.maxTurns && args.maxTurns > 0 ? args.maxTurns : undefined;
 	let turnCount = 0;
+	let maxTurnsReached = false;
+	const outputMaxTokens = args.maxOutputTokens && args.maxOutputTokens > 0
+		? Math.min(AGENT_LOOP_MAX_TOKENS, args.maxOutputTokens)
+		: AGENT_LOOP_MAX_TOKENS;
 	const config: AgentLoopConfig = {
 		model,
 		apiKey,
 		headers,
-		maxTokens: boundedMaxTokens(model, AGENT_LOOP_MAX_TOKENS),
+		maxTokens: boundedMaxTokens(model, outputMaxTokens),
 		convertToLlm: (msgs) => msgs as Message[],
 		toolExecution: "sequential",
 		...(reasoning && thinkingLevel !== "off" ? { reasoning: thinkingLevel } : {}),
@@ -180,7 +273,8 @@ ${conversation}`;
 			? {
 				shouldStopAfterTurn: () => {
 					turnCount++;
-					return turnCount >= effectiveMaxTurns;
+					maxTurnsReached = turnCount >= effectiveMaxTurns;
+					return maxTurnsReached;
 				},
 			}
 			: {}),
@@ -191,8 +285,30 @@ ${conversation}`;
 	for await (const _event of stream) {
 		// Drain events; the tool's execute already collects records.
 	}
-	await stream.result();
+	const finalMessages = await stream.result();
+	const messages = Array.isArray(finalMessages) ? finalMessages : [];
+	const lastAssistant = [...messages].reverse().find((message) => (message as { role?: unknown }).role === "assistant") as
+		| { stopReason?: unknown }
+		| undefined;
+	const providerStopReason = typeof lastAssistant?.stopReason === "string" ? lastAssistant.stopReason : undefined;
+	const stopReason = providerStopReason === "stop"
+		? "stop"
+		: maxTurnsReached ? "max-turns" : (providerStopReason ?? "completed");
+	return {
+		observations: Array.from(accumulated.values()),
+		stats: {
+			toolCalls,
+			added: totalAdded,
+			duplicate: totalDuplicates,
+			rejected: totalRejected,
+			stopReason,
+		},
+		covered: !maxTurnsReached && providerStopReason === "stop",
+	};
+}
 
-	if (accumulated.size === 0) return undefined;
-	return Array.from(accumulated.values());
+/** Compatibility wrapper for callers that still consume the pre-Phase-1 shape. */
+export async function runObserverObservations(args: RunObserverArgs): Promise<Observation[] | undefined> {
+	const result = await runObserver(args);
+	return result.observations.length > 0 ? result.observations : undefined;
 }

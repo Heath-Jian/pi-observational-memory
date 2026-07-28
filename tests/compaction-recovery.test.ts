@@ -2,7 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockObserver = vi.hoisted(() => vi.fn());
 
-vi.mock("../src/agents/observer/agent.js", () => ({ runObserver: mockObserver }));
+vi.mock("../src/agents/observer/agent.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../src/agents/observer/agent.js")>()),
+	runObserver: mockObserver,
+}));
 
 import { registerCompactionHook } from "../src/hooks/compaction-hook.js";
 import { registerCompactionTrigger } from "../src/hooks/compaction-trigger.js";

@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { normalizeSourceEntryIds, OBSERVATION_TIMESTAMP_PATTERN, runObserver } from "../src/agents/observer/agent.js";
+import {
+	normalizeSourceEntryIds,
+	OBSERVATION_TIMESTAMP_PATTERN,
+	runObserver,
+	runObserverObservations,
+} from "../src/agents/observer/agent.js";
 import { estimateStringTokens } from "../src/tokens.js";
 
 function fakeAgentLoop(handler: (prompts: any[], context: any, config: any) => Promise<void> | void): any {
@@ -10,7 +15,7 @@ function fakeAgentLoop(handler: (prompts: any[], context: any, config: any) => P
 		},
 		result: async () => {
 			await handler(prompts, context, config);
-			return {};
+			return [{ role: "assistant", content: [], stopReason: "stop" }];
 		},
 	})) as any;
 }
@@ -63,17 +68,19 @@ describe("runObserver", () => {
 			});
 		});
 
-		const observations = await runObserver({ ...baseArgs, agentLoop: loop });
+		const result = await runObserver({ ...baseArgs, agentLoop: loop });
 
-		expect(observations).toHaveLength(1);
-		expect(observations?.[0]).toMatchObject({
+		expect(result.observations).toHaveLength(1);
+		expect(result.observations[0]).toMatchObject({
 			content,
 			timestamp: "2026-05-02 10:30",
 			relevance: "high",
 			sourceEntryIds: ["entry-a"],
 			tokenCount: estimateStringTokens(content),
 		});
-		expect(observations?.[0].id).toMatch(/^[a-f0-9]{12}$/);
+		expect(result.observations[0].id).toMatch(/^[a-f0-9]{12}$/);
+		expect(result.stats).toEqual({ toolCalls: 1, added: 1, duplicate: 0, rejected: 0, stopReason: "stop" });
+		expect(result.covered).toBe(true);
 	});
 
 	it("rejects invented source ids and returns no observations", async () => {
@@ -83,7 +90,10 @@ describe("runObserver", () => {
 			});
 		});
 
-		await expect(runObserver({ ...baseArgs, agentLoop: loop })).resolves.toBeUndefined();
+		await expect(runObserver({ ...baseArgs, agentLoop: loop })).resolves.toMatchObject({
+			observations: [],
+			stats: { toolCalls: 1, added: 0, duplicate: 0, rejected: 1, stopReason: "stop" },
+		});
 	});
 
 	it("dedupes deterministic ids", async () => {
@@ -96,15 +106,42 @@ describe("runObserver", () => {
 			});
 		});
 
-		const observations = await runObserver({ ...baseArgs, agentLoop: loop });
+		const result = await runObserver({ ...baseArgs, agentLoop: loop });
 
-		expect(observations).toHaveLength(1);
-		expect(observations?.[0].content).toBe("Same content");
+		expect(result.observations).toHaveLength(1);
+		expect(result.observations[0].content).toBe("Same content");
+		expect(result.stats).toMatchObject({ toolCalls: 1, added: 1, duplicate: 1, rejected: 0 });
 	});
 
-	it("returns undefined when no tool call records observations", async () => {
+	it("aggregates structured stats across tool calls", async () => {
+		const loop = fakeAgentLoop(async (_prompts, context) => {
+			await context.tools[0].execute("tool-1", {
+				observations: [
+					{ timestamp: "2026-05-02 10:30", content: "First", relevance: "high", sourceEntryIds: ["entry-a"] },
+					{ timestamp: "2026-05-02 10:31", content: "Invalid", relevance: "low", sourceEntryIds: ["missing"] },
+				],
+			});
+			await context.tools[0].execute("tool-2", {
+				observations: [
+					{ timestamp: "2026-05-02 10:32", content: "First", relevance: "high", sourceEntryIds: ["entry-a"] },
+					{ timestamp: "2026-05-02 10:33", content: "Second", relevance: "medium", sourceEntryIds: ["entry-a"] },
+				],
+			});
+		});
+
+		const result = await runObserver({ ...baseArgs, agentLoop: loop });
+
+		expect(result.observations.map((observation) => observation.content)).toEqual(["First", "Second"]);
+		expect(result.stats).toEqual({ toolCalls: 2, added: 2, duplicate: 1, rejected: 1, stopReason: "stop" });
+	});
+
+	it("returns structured empty stats and keeps the legacy undefined wrapper", async () => {
 		const loop = fakeAgentLoop(() => {});
-		await expect(runObserver({ ...baseArgs, agentLoop: loop })).resolves.toBeUndefined();
+		await expect(runObserver({ ...baseArgs, agentLoop: loop })).resolves.toMatchObject({
+			observations: [],
+			stats: { toolCalls: 0, added: 0, duplicate: 0, rejected: 0, stopReason: "stop" },
+		});
+		await expect(runObserverObservations({ ...baseArgs, agentLoop: loop })).resolves.toBeUndefined();
 	});
 
 	it("uses maxTurns as an observer turn cap", async () => {
@@ -118,6 +155,17 @@ describe("runObserver", () => {
 		expect(shouldStopAfterTurn).toBeTypeOf("function");
 		expect(shouldStopAfterTurn({})).toBe(false);
 		expect(shouldStopAfterTurn({})).toBe(true);
+	});
+
+	it("caps bounded observer output to the reserved allowance", async () => {
+		let seenMaxTokens: unknown;
+		const loop = fakeAgentLoop((_prompts, _context, config) => {
+			seenMaxTokens = config.maxTokens;
+		});
+
+		await runObserver({ ...baseArgs, agentLoop: loop, maxOutputTokens: 1_234 });
+
+		expect(seenMaxTokens).toBe(1_234);
 	});
 
 	it("uses configured observer thinking level for reasoning models", async () => {

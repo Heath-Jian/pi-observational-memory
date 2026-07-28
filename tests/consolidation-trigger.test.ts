@@ -6,11 +6,14 @@ const mockAgents = vi.hoisted(() => ({
 	runDropper: vi.fn(),
 }));
 
-vi.mock("../src/agents/observer/agent.js", () => ({ runObserver: mockAgents.runObserver }));
+vi.mock("../src/agents/observer/agent.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../src/agents/observer/agent.js")>()),
+	runObserver: mockAgents.runObserver,
+}));
 vi.mock("../src/agents/reflector/agent.js", () => ({ runReflector: mockAgents.runReflector }));
 vi.mock("../src/agents/dropper/agent.js", () => ({ runDropper: mockAgents.runDropper }));
 
-import { registerConsolidationTrigger } from "../src/hooks/consolidation-trigger.js";
+import { registerConsolidationTrigger, selectObserverChunk } from "../src/hooks/consolidation-trigger.js";
 import { Runtime } from "../src/runtime.js";
 import {
 	OM_OBSERVATIONS_DROPPED,
@@ -41,6 +44,9 @@ function setup(args: {
 	entries: TestEntry[];
 	passive?: boolean;
 	observeAfterTokens?: number;
+	observerChunkMaxTokens?: number;
+	observerChunkOverlapEntries?: number;
+	observerChunkOutputReserveTokens?: number;
 	reflectAfterTokens?: number;
 	reflectAfterObservationTokens?: number;
 	reflectAfterObserverBatches?: number;
@@ -84,6 +90,9 @@ function setup(args: {
 		passive: args.passive ?? false,
 		debugLog: false,
 		observeAfterTokens: args.observeAfterTokens ?? 1,
+		observerChunkMaxTokens: args.observerChunkMaxTokens ?? 0,
+		observerChunkOverlapEntries: args.observerChunkOverlapEntries ?? 0,
+		observerChunkOutputReserveTokens: args.observerChunkOutputReserveTokens ?? 8_000,
 		reflectAfterTokens: args.reflectAfterTokens ?? 999,
 		reflectAfterObservationTokens: args.reflectAfterObservationTokens ?? 999,
 		reflectAfterObserverBatches: args.reflectAfterObserverBatches ?? 999,
@@ -123,6 +132,86 @@ function setup(args: {
 
 	return { pi, runtime, ctx, handlers, eventHandlers, fireAgentEnd, fireAgentStart, advance, getEntries: () => entries };
 }
+
+describe("bounded observer chunk selection", () => {
+	const select = (overrides: Partial<Parameters<typeof selectObserverChunk>[0]> = {}) => selectObserverChunk({
+		entries: [
+			textCustomMessage("raw-1", "a".repeat(20_000)),
+			textCustomMessage("raw-2", "b".repeat(20_000)),
+			textCustomMessage("raw-3", "c".repeat(20_000)),
+		] as any,
+		priorReflections: [],
+		priorObservations: [],
+		maxTokens: 12_000,
+		overlapEntries: 0,
+		outputReserveTokens: 1_000,
+		...overrides,
+	});
+
+	it("keeps legacy full serialization and the last-entry watermark when disabled", () => {
+		const selection = select({ maxTokens: 0 });
+		expect(selection.allowedSourceEntryIds).toEqual(["raw-1", "raw-2", "raw-3"]);
+		expect(selection.coversUpToId).toBe("raw-3");
+		expect(selection.sourceEntryCount).toBe(3);
+		expect(selection.configuredBudget).toBe(0);
+	});
+
+	it("selects oldest prefixes that can cover all entries over successive successful batches", () => {
+		let remaining = [
+			textCustomMessage("raw-1", "a".repeat(20_000)),
+			textCustomMessage("raw-2", "b".repeat(20_000)),
+			textCustomMessage("raw-3", "c".repeat(20_000)),
+		] as any[];
+		const covered: string[] = [];
+		while (remaining.length > 0) {
+			const selection = select({ entries: remaining as any });
+			expect(selection.estimatedPromptTokens + selection.outputReserveTokens).toBeLessThanOrEqual(selection.budget);
+			covered.push(selection.coversUpToId as string);
+			remaining = remaining.slice(selection.sourceEntryCount);
+		}
+		expect(covered).toEqual(["raw-1", "raw-2", "raw-3"]);
+	});
+
+	it("keeps overlap read-only by excluding it from the coverage watermark", () => {
+		const selection = select({
+			entries: [
+				textCustomMessage("raw-1", "a".repeat(10_000)),
+				textCustomMessage("raw-2", "b".repeat(10_000)),
+				textCustomMessage("raw-3", "c".repeat(40_000)),
+			] as any,
+			overlapEntries: 1,
+		});
+		expect(selection.coversUpToId).toBe("raw-1");
+		expect(selection.allowedSourceEntryIds).toEqual(["raw-1"]);
+		expect(selection.chunk).toContain("READ-ONLY OVERLAP CONTEXT");
+		expect(selection.chunk).toContain("raw-2");
+		expect(selection.sourceEntryCount).toBe(1);
+		expect(selection.overlapEntryCount).toBe(1);
+		expect(selection.promptSourceEntryCount).toBe(2);
+	});
+
+	it("forces one oldest entry and marks prior-memory budget exhaustion", () => {
+		const selection = select({
+			maxTokens: 5_000,
+			priorObservations: ["p".repeat(30_000)],
+		});
+		expect(selection.sourceEntryCount).toBe(1);
+		expect(selection.coversUpToId).toBe("raw-1");
+		expect(selection.budgetExhaustedByPriorMemory).toBe(true);
+	});
+
+	it("forces one oversized source entry instead of shrinking forever", () => {
+		const selection = select({
+			entries: [textCustomMessage("huge", "x".repeat(80_000))] as any,
+			maxTokens: 5_000,
+		});
+		expect(selection.sourceEntryCount).toBe(1);
+		expect(selection.coversUpToId).toBe("huge");
+		expect(selection.budgetExhaustedByPriorMemory).toBe(false);
+		expect(selection.oversizedEntry).toBe(true);
+		expect(selection.oversizedEntryTokens).toBeGreaterThan(selection.budget);
+	});
+});
 
 describe("single-stage consolidation scheduler", () => {
 	const obsA = observation("aaaaaaaaaaaa", { sourceEntryIds: ["raw-1"], tokenCount: 10 });
@@ -168,6 +257,56 @@ describe("single-stage consolidation scheduler", () => {
 		));
 		expect(mockAgents.runReflector).not.toHaveBeenCalled();
 		expect(mockAgents.runDropper).not.toHaveBeenCalled();
+	});
+
+	it("advances bounded observer batches through each oldest prefix", async () => {
+		mockAgents.runObserver.mockResolvedValueOnce([obsA]).mockResolvedValueOnce([obsB]);
+		const subject = setup({
+			entries: [
+				textCustomMessage("raw-1", "a".repeat(20_000)),
+				textCustomMessage("raw-2", "b".repeat(20_000)),
+			],
+			observerChunkMaxTokens: 12_000,
+			observerChunkOutputReserveTokens: 1_000,
+		});
+		subject.fireAgentEnd();
+		await subject.advance();
+		await vi.waitFor(() => expect(subject.pi.appendEntry).toHaveBeenCalledWith(
+			OM_OBSERVATIONS_RECORDED,
+			{ observations: [obsA], coversUpToId: "raw-1" },
+		));
+		await subject.advance();
+		await vi.waitFor(() => expect(subject.pi.appendEntry).toHaveBeenCalledWith(
+			OM_OBSERVATIONS_RECORDED,
+			{ observations: [obsB], coversUpToId: "raw-2" },
+		));
+		expect(mockAgents.runObserver).toHaveBeenCalledTimes(2);
+		expect(mockAgents.runObserver.mock.calls[0][0].chunk).toContain("raw-1");
+		expect(mockAgents.runObserver.mock.calls[0][0].chunk).not.toContain("raw-2");
+		expect(mockAgents.runObserver.mock.calls[1][0].chunk).toContain("raw-2");
+	});
+
+	it("does not advance past a bounded batch that fails midway", async () => {
+		mockAgents.runObserver.mockResolvedValueOnce([obsA]).mockResolvedValueOnce(undefined);
+		const subject = setup({
+			entries: [
+				textCustomMessage("raw-1", "a".repeat(20_000)),
+				textCustomMessage("raw-2", "b".repeat(20_000)),
+			],
+			observerChunkMaxTokens: 12_000,
+			observerChunkOutputReserveTokens: 1_000,
+		});
+		subject.fireAgentEnd();
+		await subject.advance();
+		await vi.waitFor(() => expect(subject.pi.appendEntry).toHaveBeenCalledTimes(1));
+		await subject.advance();
+		await vi.waitFor(() => expect(subject.runtime.stageFailureStatus("observer")?.failures).toBe(1));
+		expect(subject.pi.appendEntry).toHaveBeenCalledTimes(1);
+		expect(subject.pi.appendEntry).toHaveBeenLastCalledWith(
+			OM_OBSERVATIONS_RECORDED,
+			{ observations: [obsA], coversUpToId: "raw-1" },
+		);
+		expect(mockAgents.runObserver.mock.calls[1][0].chunk).toContain("raw-2");
 	});
 
 	it("schedules reflector as a separate task after observer commits", async () => {

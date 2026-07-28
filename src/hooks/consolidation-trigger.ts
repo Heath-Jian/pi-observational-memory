@@ -1,12 +1,19 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { runDropper } from "../agents/dropper/agent.js";
 import { observationPoolMetrics } from "../agents/dropper/pool.js";
-import { runObserver } from "../agents/observer/agent.js";
+import {
+	estimateObserverPromptTokens,
+	estimateObserverPromptTokensForChunkCharacters,
+	runObserver,
+	type ObserverRunResult,
+	type ObserverRunStats,
+} from "../agents/observer/agent.js";
 import { runReflector } from "../agents/reflector/agent.js";
 import { getBackgroundBroker, withBackgroundLease } from "../background-broker.js";
 import { debugLog, withDebugLogContext } from "../debug-log.js";
 import { type ConsolidationPhase, type ResolveResult, type Runtime } from "../runtime.js";
 import { serializeSourceAddressedBranchEntries } from "../serialize.js";
+import { estimateStringTokens } from "../tokens.js";
 import {
 	OM_OBSERVATIONS_DROPPED,
 	OM_OBSERVATIONS_RECORDED,
@@ -70,6 +77,170 @@ function stagePriority(phase: ConsolidationPhase, runtime: Runtime): number {
 
 function sourceEntriesAfter(entries: Entry[], index: number): Entry[] {
 	return entries.slice(index + 1).filter(isSourceEntry);
+}
+
+const OBSERVER_BUDGET_SAFETY_FACTOR = 0.9;
+
+export type ObserverChunkSelection = {
+	chunk: string;
+	allowedSourceEntryIds: string[];
+	coversUpToId?: string;
+	sourceEntryCount: number;
+	overlapEntryCount: number;
+	promptSourceEntryCount: number;
+	estimatedPromptTokens: number;
+	priorMemoryTokens: number;
+	configuredBudget: number;
+	budget: number;
+	outputReserveTokens: number;
+	budgetExhaustedByPriorMemory: boolean;
+	oversizedEntry: boolean;
+	oversizedEntryTokens?: number;
+};
+
+/**
+ * Select the oldest uncovered source prefix for one observer request. Bounded
+ * mode budgets the complete estimated prompt plus output allowance against 90%
+ * of the configured limit; the margin absorbs tokenizer/model accounting error.
+ */
+export function selectObserverChunk(args: {
+	entries: Entry[];
+	priorReflections: string[];
+	priorObservations: string[];
+	maxTokens: number;
+	overlapEntries: number;
+	outputReserveTokens: number;
+}): ObserverChunkSelection {
+	const configuredBudget = Number.isFinite(args.maxTokens) && args.maxTokens > 0
+		? Math.floor(args.maxTokens)
+		: 0;
+	const outputReserveTokens = Number.isFinite(args.outputReserveTokens) && args.outputReserveTokens > 0
+		? Math.floor(args.outputReserveTokens)
+		: 0;
+	const overlapEntries = Number.isFinite(args.overlapEntries) && args.overlapEntries > 0
+		? Math.floor(args.overlapEntries)
+		: 0;
+
+	if (configuredBudget === 0) {
+		const serialized = serializeSourceAddressedBranchEntries(args.entries);
+		const estimate = estimateObserverPromptTokens({
+			priorReflections: args.priorReflections,
+			priorObservations: args.priorObservations,
+			chunk: serialized.text,
+		});
+		return {
+			chunk: serialized.text,
+			allowedSourceEntryIds: serialized.sourceEntryIds,
+			coversUpToId: args.entries.at(-1)?.id,
+			sourceEntryCount: serialized.sourceEntryIds.length,
+			overlapEntryCount: 0,
+			promptSourceEntryCount: serialized.sourceEntryIds.length,
+			estimatedPromptTokens: estimate.promptTokens,
+			priorMemoryTokens: estimate.priorMemoryTokens,
+			configuredBudget: 0,
+			budget: 0,
+			outputReserveTokens,
+			budgetExhaustedByPriorMemory: false,
+			oversizedEntry: false,
+		};
+	}
+
+	const units = args.entries.flatMap((entry) => {
+		const serialized = serializeSourceAddressedBranchEntries([entry]);
+		const id = serialized.sourceEntryIds[0];
+		return id && serialized.text.trim() ? [{ id, text: serialized.text }] : [];
+	});
+	const budget = Math.max(1, Math.floor(configuredBudget * OBSERVER_BUDGET_SAFETY_FACTOR));
+	const overlapMarker = "[READ-ONLY OVERLAP CONTEXT — do not record observations from these entries]";
+	const prefixCharacterCounts = [0];
+	for (const unit of units) {
+		const separatorCharacters = prefixCharacterCounts.length > 1 ? 2 : 0;
+		prefixCharacterCounts.push(prefixCharacterCounts.at(-1)! + separatorCharacters + unit.text.length);
+	}
+	const estimateChunk = (sourceCount: number, promptCount = sourceCount) => {
+		const overlapMarkerCharacters = promptCount > sourceCount ? overlapMarker.length + 1 : 0;
+		return estimateObserverPromptTokensForChunkCharacters({
+			priorReflections: args.priorReflections,
+			priorObservations: args.priorObservations,
+			chunkCharacters: prefixCharacterCounts[promptCount] + overlapMarkerCharacters,
+		});
+	};
+	const buildChunk = (sourceCount: number, promptCount: number): string => {
+		const sourceChunk = units.slice(0, sourceCount).map((unit) => unit.text).join("\n\n");
+		const overlapChunk = units.slice(sourceCount, promptCount).map((unit) => unit.text).join("\n\n");
+		return overlapChunk ? `${sourceChunk}\n\n${overlapMarker}\n${overlapChunk}` : sourceChunk;
+	};
+	const emptyEstimate = estimateChunk(0);
+	const budgetExhaustedByPriorMemory = emptyEstimate.promptTokens + outputReserveTokens > budget;
+	if (units.length === 0) {
+		return {
+			chunk: "",
+			allowedSourceEntryIds: [],
+			sourceEntryCount: 0,
+			overlapEntryCount: 0,
+			promptSourceEntryCount: 0,
+			estimatedPromptTokens: emptyEstimate.promptTokens,
+			priorMemoryTokens: emptyEstimate.priorMemoryTokens,
+			configuredBudget,
+			budget,
+			outputReserveTokens,
+			budgetExhaustedByPriorMemory,
+			oversizedEntry: false,
+		};
+	}
+
+	const firstEstimate = estimateChunk(1);
+	const firstEntryTokens = estimateStringTokens(units[0].text);
+	const oversizedEntry = firstEntryTokens > budget
+		|| (!budgetExhaustedByPriorMemory && firstEstimate.promptTokens + outputReserveTokens > budget);
+	let sourceEntryCount = 0;
+	let promptEntryCount = 0;
+
+	if (budgetExhaustedByPriorMemory || oversizedEntry) {
+		// There is no smaller source unit to submit. Force one entry so batching
+		// cannot stall in an infinite shrink loop; diagnostics expose the breach.
+		sourceEntryCount = 1;
+		promptEntryCount = 1;
+	} else {
+		for (let candidateSourceCount = 1; candidateSourceCount <= units.length; candidateSourceCount++) {
+			const candidatePromptCount = Math.min(units.length, candidateSourceCount + overlapEntries);
+			const candidate = estimateChunk(candidateSourceCount, candidatePromptCount);
+			if (candidate.promptTokens + outputReserveTokens <= budget) {
+				sourceEntryCount = candidateSourceCount;
+				promptEntryCount = candidatePromptCount;
+			}
+		}
+
+		if (sourceEntryCount === 0) {
+			// Requested overlap did not fit, but the first source entry does. Keep
+			// the oldest prefix and append only the overlap entries that still fit.
+			sourceEntryCount = 1;
+			promptEntryCount = 1;
+			while (promptEntryCount < Math.min(units.length, 1 + overlapEntries)) {
+				const candidate = estimateChunk(sourceEntryCount, promptEntryCount + 1);
+				if (candidate.promptTokens + outputReserveTokens > budget) break;
+				promptEntryCount++;
+			}
+		}
+	}
+
+	const selected = estimateChunk(sourceEntryCount, promptEntryCount);
+	return {
+		chunk: buildChunk(sourceEntryCount, promptEntryCount),
+		allowedSourceEntryIds: units.slice(0, sourceEntryCount).map((unit) => unit.id),
+		coversUpToId: units[sourceEntryCount - 1]?.id,
+		sourceEntryCount,
+		overlapEntryCount: promptEntryCount - sourceEntryCount,
+		promptSourceEntryCount: promptEntryCount,
+		estimatedPromptTokens: selected.promptTokens,
+		priorMemoryTokens: selected.priorMemoryTokens,
+		configuredBudget,
+		budget,
+		outputReserveTokens,
+		budgetExhaustedByPriorMemory,
+		oversizedEntry,
+		...(oversizedEntry ? { oversizedEntryTokens: firstEntryTokens } : {}),
+	};
 }
 
 function appendEntry(pi: ExtensionAPI, customType: string, data: unknown): void {
@@ -374,6 +545,43 @@ async function runStage(
 	return runDropperStage(pi, runtime, ctx, resolveModel, run);
 }
 
+function normalizeObserverRunResult(value: ObserverRunResult | unknown): ObserverRunResult {
+	if (Array.isArray(value)) {
+		return {
+			observations: value as ObserverRunResult["observations"],
+			stats: {
+				toolCalls: value.length > 0 ? 1 : 0,
+				added: value.length,
+				duplicate: 0,
+				rejected: 0,
+				stopReason: "legacy-result",
+			},
+		};
+	}
+	if (value && typeof value === "object" && Array.isArray((value as ObserverRunResult).observations)) {
+		return value as ObserverRunResult;
+	}
+	return {
+		observations: [],
+		stats: { toolCalls: 0, added: 0, duplicate: 0, rejected: 0, stopReason: "no-result" },
+	};
+}
+
+function errorText(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+function isContextOverflowError(error: unknown): boolean {
+	return /context[_ -]?length|maximum context|context window|too many (?:input )?tokens|token limit|input.{0,30}exceed/i.test(errorText(error));
+}
+
+function observerFailureSubtypes(stats: ObserverRunStats): string[] {
+	if (stats.toolCalls === 0) return ["zero-calls"];
+	const subtypes = ["all-rejected"];
+	if (stats.rejected > 0) subtypes.push("invalid-ids");
+	return subtypes;
+}
+
 async function runObserverStage(
 	pi: ExtensionAPI,
 	runtime: Runtime,
@@ -386,33 +594,114 @@ async function runObserverStage(
 	if (!runtime.compactionDeferred && tokens < runtime.config.observeAfterTokens) return true;
 	const lastCoverageIdx = latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED);
 	const chunkEntries = sourceEntriesAfter(entries, lastCoverageIdx);
-	const coversUpToId = chunkEntries.at(-1)?.id;
-	if (!coversUpToId) return true;
-	const { text: chunk, sourceEntryIds } = serializeSourceAddressedBranchEntries(chunkEntries);
-	if (!chunk.trim() || sourceEntryIds.length === 0) return true;
+	if (chunkEntries.length === 0) return true;
 
 	const memory = fullProjection(entries);
+	const priorReflections = memory.reflections.map(reflectionToSummaryLine);
+	const priorObservations = memory.observations.map(observationToSummaryLine);
+	const selection = selectObserverChunk({
+		entries: chunkEntries,
+		priorReflections,
+		priorObservations,
+		maxTokens: runtime.config.observerChunkMaxTokens,
+		overlapEntries: runtime.config.observerChunkOverlapEntries,
+		outputReserveTokens: runtime.config.observerChunkOutputReserveTokens,
+	});
+	const coversUpToId = selection.coversUpToId;
+	if (!coversUpToId || !selection.chunk.trim() || selection.allowedSourceEntryIds.length === 0) return true;
+
 	if (shouldNotifyWorker(runtime, ctx)) ctx.ui?.notify(`Observational memory: observer running on ~${tokens.toLocaleString()}-token chunk`, "info");
-	debugLog("observer.start", { tokens, coversUpToId, sourceEntryCount: sourceEntryIds.length });
 	const resolved = await resolveModel("observer");
 	if (!resolved || !isRunCurrent(runtime, ctx, run)) return false;
-	const observations = await runObserver({
-		model: resolved.model as any,
-		apiKey: resolved.apiKey,
-		headers: resolved.headers,
-		priorReflections: memory.reflections.map(reflectionToSummaryLine),
-		priorObservations: memory.observations.map(observationToSummaryLine),
-		chunk,
-		allowedSourceEntryIds: sourceEntryIds,
-		signal: run.signal,
-		maxTurns: runtime.config.agentMaxTurns,
-		thinkingLevel: runtime.config.model?.thinking ?? "low",
+	const model = resolved.model as { provider?: string; id?: string };
+	const diagnostics = {
+		tokens,
+		coversUpToId,
+		provider: model.provider ?? runtime.config.model?.provider,
+		model: model.id ?? runtime.config.model?.id,
+		estimatedPromptTokens: selection.estimatedPromptTokens,
+		estimatedRequestTokens: selection.estimatedPromptTokens + selection.outputReserveTokens,
+		configuredBudget: selection.configuredBudget,
+		budget: selection.budget,
+		outputReserveTokens: selection.outputReserveTokens,
+		sourceEntryCount: selection.sourceEntryCount,
+		overlapEntryCount: selection.overlapEntryCount,
+		promptSourceEntryCount: selection.promptSourceEntryCount,
+		priorMemoryTokens: selection.priorMemoryTokens,
+		budgetExhaustedByPriorMemory: selection.budgetExhaustedByPriorMemory,
+		oversizedEntry: selection.oversizedEntry,
+		oversizedEntryTokens: selection.oversizedEntryTokens,
+	};
+	debugLog("observer.start", diagnostics);
+
+	let result: ObserverRunResult;
+	try {
+		const rawResult = await runObserver({
+			model: resolved.model as any,
+			apiKey: resolved.apiKey,
+			headers: resolved.headers,
+			priorReflections,
+			priorObservations,
+			chunk: selection.chunk,
+			allowedSourceEntryIds: selection.allowedSourceEntryIds,
+			signal: run.signal,
+			maxTurns: runtime.config.agentMaxTurns,
+			thinkingLevel: runtime.config.model?.thinking ?? "low",
+			...(selection.configuredBudget > 0
+				? { maxOutputTokens: selection.outputReserveTokens }
+				: {}),
+		});
+		result = normalizeObserverRunResult(rawResult);
+	} catch (error) {
+		const contextOverflow = isContextOverflowError(error);
+		const timeout = run.signal.aborted && /timeout/i.test(String(run.signal.reason ?? errorText(error)));
+		const failureSubtype = contextOverflow ? "context-overflow" : timeout ? "timeout" : "error";
+		debugLog("observer.empty", {
+			...diagnostics,
+			failureSubtype,
+			contextOverflow,
+			timeout,
+			error: errorText(error),
+		});
+		throw error;
+	}
+
+	if (!isRunCurrent(runtime, ctx, run)) return false;
+	if (result.observations.length === 0) {
+		const failureSubtypes = observerFailureSubtypes(result.stats);
+		debugLog("observer.empty", {
+			...diagnostics,
+			...result.stats,
+			covered: result.covered,
+			failureSubtype: result.stats.rejected > 0 ? "invalid-ids" : failureSubtypes[0],
+			failureSubtypes,
+			allRejected: true,
+			invalidIds: result.stats.rejected > 0,
+			contextOverflow: false,
+		});
+		return false;
+	}
+	const data = buildObservationsRecordedData(result.observations, coversUpToId);
+	if (!data) {
+		debugLog("observer.empty", {
+			...diagnostics,
+			...result.stats,
+			covered: result.covered,
+			failureSubtype: "all-rejected",
+			contextOverflow: false,
+		});
+		return false;
+	}
+	debugLog("observer.records", {
+		...diagnostics,
+		observationCount: result.observations.length,
+		...result.stats,
+		covered: result.covered,
+		invalidIds: result.stats.rejected > 0,
+		contextOverflow: false,
 	});
-	if (!isRunCurrent(runtime, ctx, run) || !observations?.length) return false;
-	const data = buildObservationsRecordedData(observations, coversUpToId);
-	if (!data) return false;
 	appendEntry(pi, OM_OBSERVATIONS_RECORDED, data);
-	if (shouldNotifyWorker(runtime, ctx)) ctx.ui?.notify(`Observational memory: ${observations.length} observation${observations.length === 1 ? "" : "s"} recorded`, "info");
+	if (shouldNotifyWorker(runtime, ctx)) ctx.ui?.notify(`Observational memory: ${result.observations.length} observation${result.observations.length === 1 ? "" : "s"} recorded`, "info");
 	return true;
 }
 

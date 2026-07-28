@@ -37,6 +37,9 @@ describe("V3 config", () => {
 	it("uses V3 defaults", () => {
 		expect(DEFAULTS).toEqual({
 			observeAfterTokens: 10000,
+			observerChunkMaxTokens: 0,
+			observerChunkOverlapEntries: 0,
+			observerChunkOutputReserveTokens: 8000,
 			reflectAfterTokens: 20000,
 			compactAfterTokens: 81000,
 			compactAfterTokensMode: "calibrated",
@@ -67,6 +70,9 @@ describe("V3 config", () => {
 		writeJson(join(agentDir, "settings.json"), {
 			"observational-memory": {
 				observeAfterTokens: 10,
+				observerChunkMaxTokens: 12_000,
+				observerChunkOverlapEntries: 2,
+				observerChunkOutputReserveTokens: 2_000,
 				reflectAfterTokens: 20,
 				compactAfterTokens: 30,
 				observationsPoolMaxTokens: 40,
@@ -99,6 +105,9 @@ describe("V3 config", () => {
 
 		expect(loadConfig(cwd, { PI_OBSERVATIONAL_MEMORY_PASSIVE: "true" })).toMatchObject({
 			observeAfterTokens: 100,
+			observerChunkMaxTokens: 12_000,
+			observerChunkOverlapEntries: 2,
+			observerChunkOutputReserveTokens: 2_000,
 			reflectAfterTokens: 20,
 			compactAfterTokens: 30,
 			observationsPoolMaxTokens: 40,
@@ -126,6 +135,9 @@ describe("V3 config", () => {
 		writeJson(join(cwd, ".pi", "settings.json"), {
 			"observational-memory": {
 				observeAfterTokens: -1,
+				observerChunkMaxTokens: -1,
+				observerChunkOverlapEntries: 1.5,
+				observerChunkOutputReserveTokens: 0,
 				reflectAfterTokens: 0,
 				compactAfterTokens: 1.5,
 				observationsPoolMaxTokens: "20000",

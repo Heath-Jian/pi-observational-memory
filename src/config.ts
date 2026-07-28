@@ -56,6 +56,21 @@ export interface CompactAfterTokensOverride {
 
 export interface Config {
 	observeAfterTokens: number;
+	/**
+	 * Maximum estimated tokens for one observer request. A value of 0 keeps the
+	 * legacy behavior and sends the entire uncovered source range.
+	 */
+	observerChunkMaxTokens: number;
+	/**
+	 * Read-only source entries appended after a bounded batch for context. These
+	 * entries are never included in the batch coverage watermark.
+	 */
+	observerChunkOverlapEntries: number;
+	/**
+	 * Output tokens reserved inside observerChunkMaxTokens. In bounded mode this
+	 * also caps the observer response token allowance.
+	 */
+	observerChunkOutputReserveTokens: number;
 	reflectAfterTokens: number;
 	compactAfterTokens: number;
 	compactAfterTokensMode: CompactAfterTokensMode;
@@ -83,6 +98,9 @@ export interface Config {
 
 export const DEFAULTS: Config = {
 	observeAfterTokens: 10_000,
+	observerChunkMaxTokens: 0,
+	observerChunkOverlapEntries: 0,
+	observerChunkOutputReserveTokens: 8_000,
 	reflectAfterTokens: 20_000,
 	compactAfterTokens: 81_000,
 	compactAfterTokensMode: "calibrated",
@@ -154,6 +172,10 @@ function positiveIntegerOrUndefined(value: unknown): number | undefined {
 	return Number.isInteger(value) && typeof value === "number" && value > 0 ? value : undefined;
 }
 
+function nonNegativeIntegerOrUndefined(value: unknown): number | undefined {
+	return Number.isInteger(value) && typeof value === "number" && value >= 0 ? value : undefined;
+}
+
 function validTargetOrUndefined(value: unknown, maxTokens: number): number | undefined {
 	const target = positiveIntegerOrUndefined(value);
 	return target !== undefined && target < maxTokens ? target : undefined;
@@ -218,6 +240,7 @@ function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config
 	const normalized: Partial<Config> = {};
 	const numberKeys = [
 		"observeAfterTokens",
+		"observerChunkOutputReserveTokens",
 		"reflectAfterTokens",
 		"compactAfterTokens",
 		"observationsPoolMaxTokens",
@@ -236,6 +259,10 @@ function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config
 	] as const;
 	for (const key of numberKeys) {
 		const normalizedValue = positiveIntegerOrUndefined(value[key]);
+		if (normalizedValue !== undefined) normalized[key] = normalizedValue;
+	}
+	for (const key of ["observerChunkMaxTokens", "observerChunkOverlapEntries"] as const) {
+		const normalizedValue = nonNegativeIntegerOrUndefined(value[key]);
 		if (normalizedValue !== undefined) normalized[key] = normalizedValue;
 	}
 	if (isCompactAfterTokensMode(value.compactAfterTokensMode)) {
