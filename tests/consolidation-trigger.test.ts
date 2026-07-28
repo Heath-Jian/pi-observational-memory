@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockAgents = vi.hoisted(() => ({
 	runObserver: vi.fn(),
+	runCoverageVerifier: vi.fn(),
 	runReflector: vi.fn(),
 	runDropper: vi.fn(),
 }));
@@ -9,6 +10,7 @@ const mockAgents = vi.hoisted(() => ({
 vi.mock("../src/agents/observer/agent.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../src/agents/observer/agent.js")>()),
 	runObserver: mockAgents.runObserver,
+	runCoverageVerifier: mockAgents.runCoverageVerifier,
 }));
 vi.mock("../src/agents/reflector/agent.js", () => ({ runReflector: mockAgents.runReflector }));
 vi.mock("../src/agents/dropper/agent.js", () => ({ runDropper: mockAgents.runDropper }));
@@ -32,6 +34,7 @@ import {
 beforeEach(() => {
 	vi.useFakeTimers();
 	mockAgents.runObserver.mockReset().mockResolvedValue(undefined);
+	mockAgents.runCoverageVerifier.mockReset().mockResolvedValue({ stats: { toolCalls: 0, toolErrors: 0, stopReason: "stop" } });
 	mockAgents.runReflector.mockReset().mockResolvedValue(undefined);
 	mockAgents.runDropper.mockReset().mockResolvedValue(undefined);
 });
@@ -47,6 +50,9 @@ function setup(args: {
 	observerChunkMaxTokens?: number;
 	observerChunkOverlapEntries?: number;
 	observerChunkOutputReserveTokens?: number;
+	observerEmptyCoverageCommit?: boolean;
+	observerCoverageVerifyModel?: { provider: string; id: string; thinking?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" };
+	configDiagnostics?: Array<{ level: "warning"; message: string }>;
 	reflectAfterTokens?: number;
 	reflectAfterObservationTokens?: number;
 	reflectAfterObserverBatches?: number;
@@ -93,6 +99,9 @@ function setup(args: {
 		observerChunkMaxTokens: args.observerChunkMaxTokens ?? 0,
 		observerChunkOverlapEntries: args.observerChunkOverlapEntries ?? 0,
 		observerChunkOutputReserveTokens: args.observerChunkOutputReserveTokens ?? 8_000,
+		observerEmptyCoverageCommit: args.observerEmptyCoverageCommit ?? false,
+		observerCoverageVerifyModel: args.observerCoverageVerifyModel,
+		configDiagnostics: args.configDiagnostics,
 		reflectAfterTokens: args.reflectAfterTokens ?? 999,
 		reflectAfterObservationTokens: args.reflectAfterObservationTokens ?? 999,
 		reflectAfterObserverBatches: args.reflectAfterObserverBatches ?? 999,
@@ -113,7 +122,10 @@ function setup(args: {
 		hasUI: true,
 		ui: { notify: vi.fn() },
 		model: { provider: "openai-codex", contextWindow: 272_000 },
-		modelRegistry: {},
+		modelRegistry: {
+			find: vi.fn((provider: string, id: string) => ({ provider, id })),
+			getApiKeyAndHeaders: vi.fn(async () => ({ ok: true, apiKey: "verifier-key" })),
+		},
 		isIdle: vi.fn(() => true),
 		hasPendingMessages: vi.fn(() => false),
 		compact: vi.fn(),
@@ -257,6 +269,158 @@ describe("single-stage consolidation scheduler", () => {
 		));
 		expect(mockAgents.runReflector).not.toHaveBeenCalled();
 		expect(mockAgents.runDropper).not.toHaveBeenCalled();
+	});
+
+	it("preserves non-empty progress without a finalize call in commit mode", async () => {
+		mockAgents.runObserver.mockResolvedValueOnce({
+			observations: [obsA],
+			covered: false,
+			stats: { toolCalls: 1, added: 1, duplicate: 0, rejected: 0, stopReason: "stop", commitDiagnostic: "not-called" },
+		});
+		const subject = setup({
+			entries: [textCustomMessage("raw-1", "aaaaaaaa")],
+			observerEmptyCoverageCommit: true,
+			observerCoverageVerifyModel: { provider: "openai", id: "verifier" },
+		});
+
+		subject.fireAgentEnd();
+		await subject.advance();
+
+		await vi.waitFor(() => expect(subject.pi.appendEntry).toHaveBeenCalledWith(
+			OM_OBSERVATIONS_RECORDED,
+			{ observations: [obsA], coversUpToId: "raw-1" },
+		));
+		expect(mockAgents.runCoverageVerifier).not.toHaveBeenCalled();
+	});
+
+	it("writes covered-empty progress only after the verifier accepts it", async () => {
+		mockAgents.runObserver.mockResolvedValueOnce({
+			observations: [],
+			covered: true,
+			stats: { toolCalls: 1, added: 0, duplicate: 0, rejected: 0, stopReason: "empty-coverage-commit" },
+		});
+		mockAgents.runCoverageVerifier.mockResolvedValueOnce({
+			verdict: { hasRecordableContent: false, reason: "No recordable content." },
+			stats: { toolCalls: 1, toolErrors: 0, stopReason: "toolUse" },
+		});
+		const subject = setup({
+			entries: [textCustomMessage("raw-1", "routine")],
+			observerEmptyCoverageCommit: true,
+			observerCoverageVerifyModel: { provider: "openai", id: "verifier" },
+		});
+
+		subject.fireAgentEnd();
+		await subject.advance();
+
+		await vi.waitFor(() => expect(subject.pi.appendEntry).toHaveBeenCalledWith(
+			OM_OBSERVATIONS_RECORDED,
+			{ observations: [], coversUpToId: "raw-1", covered: true },
+		));
+		expect(mockAgents.runCoverageVerifier).toHaveBeenCalledWith(expect.objectContaining({
+			chunk: expect.stringContaining("raw-1"),
+		}));
+	});
+
+	it("fails closed when the verifier finds recordable content", async () => {
+		mockAgents.runObserver.mockResolvedValueOnce({
+			observations: [],
+			covered: true,
+			stats: { toolCalls: 1, added: 0, duplicate: 0, rejected: 0, stopReason: "empty-coverage-commit" },
+		});
+		mockAgents.runCoverageVerifier.mockResolvedValueOnce({
+			verdict: { hasRecordableContent: true, reason: "A user decision is present." },
+			stats: { toolCalls: 1, toolErrors: 0, stopReason: "toolUse" },
+		});
+		const subject = setup({
+			entries: [textCustomMessage("raw-1", "decision")],
+			observerEmptyCoverageCommit: true,
+			observerCoverageVerifyModel: { provider: "openai", id: "verifier" },
+		});
+
+		subject.fireAgentEnd();
+		await subject.advance();
+
+		await vi.waitFor(() => expect(subject.runtime.stageFailureStatus("observer")?.failures).toBe(1));
+		expect(subject.pi.appendEntry).not.toHaveBeenCalled();
+	});
+
+	it("fails closed on verifier structured-output parse failure", async () => {
+		mockAgents.runObserver.mockResolvedValueOnce({
+			observations: [],
+			covered: true,
+			stats: { toolCalls: 1, added: 0, duplicate: 0, rejected: 0, stopReason: "empty-coverage-commit" },
+		});
+		mockAgents.runCoverageVerifier.mockResolvedValueOnce({
+			stats: { toolCalls: 1, toolErrors: 1, stopReason: "error" },
+		});
+		const subject = setup({
+			entries: [textCustomMessage("raw-1", "routine")],
+			observerEmptyCoverageCommit: true,
+			observerCoverageVerifyModel: { provider: "openai", id: "verifier" },
+		});
+
+		subject.fireAgentEnd();
+		await subject.advance();
+
+		await vi.waitFor(() => expect(subject.runtime.stageFailureStatus("observer")?.failures).toBe(1));
+		expect(subject.pi.appendEntry).not.toHaveBeenCalled();
+	});
+
+	it("fails closed when the verifier call throws", async () => {
+		mockAgents.runObserver.mockResolvedValueOnce({
+			observations: [],
+			covered: true,
+			stats: { toolCalls: 1, added: 0, duplicate: 0, rejected: 0, stopReason: "empty-coverage-commit" },
+		});
+		mockAgents.runCoverageVerifier.mockRejectedValueOnce(new Error("verifier timeout"));
+		const subject = setup({
+			entries: [textCustomMessage("raw-1", "routine")],
+			observerEmptyCoverageCommit: true,
+			observerCoverageVerifyModel: { provider: "openai", id: "verifier" },
+		});
+
+		subject.fireAgentEnd();
+		await subject.advance();
+
+		await vi.waitFor(() => expect(subject.runtime.stageFailureStatus("observer")?.failures).toBe(1));
+		expect(subject.pi.appendEntry).not.toHaveBeenCalled();
+	});
+
+	it("fails closed when verifier config exists but the model cannot be resolved", async () => {
+		mockAgents.runObserver.mockResolvedValueOnce({
+			observations: [],
+			covered: true,
+			stats: { toolCalls: 1, added: 0, duplicate: 0, rejected: 0, stopReason: "empty-coverage-commit" },
+		});
+		const subject = setup({
+			entries: [textCustomMessage("raw-1", "routine")],
+			observerEmptyCoverageCommit: true,
+			observerCoverageVerifyModel: { provider: "missing", id: "verifier" },
+		});
+		subject.ctx.modelRegistry.find.mockReturnValue(undefined);
+
+		subject.fireAgentEnd();
+		await subject.advance();
+
+		await vi.waitFor(() => expect(subject.runtime.stageFailureStatus("observer")?.failures).toBe(1));
+		expect(mockAgents.runCoverageVerifier).not.toHaveBeenCalled();
+		expect(subject.pi.appendEntry).not.toHaveBeenCalled();
+	});
+
+	it("surfaces config clamp warnings once at the first UI context", () => {
+		const subject = setup({
+			entries: [],
+			configDiagnostics: [{ level: "warning", message: "bounded batching requires observerEmptyCoverageCommit; falling back to full-chunk" }],
+		});
+
+		subject.fireAgentStart();
+		subject.fireAgentEnd();
+
+		expect(subject.ctx.ui.notify).toHaveBeenCalledTimes(1);
+		expect(subject.ctx.ui.notify).toHaveBeenCalledWith(
+			"Observational memory: bounded batching requires observerEmptyCoverageCommit; falling back to full-chunk",
+			"warning",
+		);
 	});
 
 	it("advances bounded observer batches through each oldest prefix", async () => {

@@ -155,7 +155,7 @@ export function reflection(
 
 export function observationsRecordedEntry(
 	id: string,
-	args: { observations: TestObservation[]; coversUpToId: string },
+	args: { observations: TestObservation[]; coversUpToId: string; covered?: boolean },
 	overrides: Partial<TestEntry> = {},
 ): TestEntry {
 	return {

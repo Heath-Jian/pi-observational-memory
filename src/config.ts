@@ -9,6 +9,11 @@ export interface ConfiguredModel {
 	thinking?: ModelThinkingLevel;
 }
 
+export interface ConfigDiagnostic {
+	level: "warning";
+	message: string;
+}
+
 /**
  * How `compactAfterTokens` is interpreted.
  *
@@ -71,6 +76,15 @@ export interface Config {
 	 * also caps the observer response token allowance.
 	 */
 	observerChunkOutputReserveTokens: number;
+	/**
+	 * Enables explicit empty-batch coverage commits. This is fail-closed and is
+	 * normalized back to false unless observerCoverageVerifyModel is valid.
+	 */
+	observerEmptyCoverageCommit: boolean;
+	/** Dedicated model that verifies every proposed empty-batch coverage commit. */
+	observerCoverageVerifyModel?: ConfiguredModel;
+	/** Load-time clamps to surface once a Runtime receives UI context. */
+	configDiagnostics?: ConfigDiagnostic[];
 	reflectAfterTokens: number;
 	compactAfterTokens: number;
 	compactAfterTokensMode: CompactAfterTokensMode;
@@ -101,6 +115,7 @@ export const DEFAULTS: Config = {
 	observerChunkMaxTokens: 0,
 	observerChunkOverlapEntries: 0,
 	observerChunkOutputReserveTokens: 8_000,
+	observerEmptyCoverageCommit: false,
 	reflectAfterTokens: 20_000,
 	compactAfterTokens: 81_000,
 	compactAfterTokensMode: "calibrated",
@@ -275,6 +290,11 @@ function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config
 			.map(normalizeCompactAfterTokensOverride)
 			.filter((override): override is CompactAfterTokensOverride => override !== undefined);
 	}
+	if (typeof value.observerEmptyCoverageCommit === "boolean") {
+		normalized.observerEmptyCoverageCommit = value.observerEmptyCoverageCommit;
+	}
+	const observerCoverageVerifyModel = normalizeModel(value.observerCoverageVerifyModel);
+	if (observerCoverageVerifyModel) normalized.observerCoverageVerifyModel = observerCoverageVerifyModel;
 	if (typeof value.showWorkerNotifications === "boolean") normalized.showWorkerNotifications = value.showWorkerNotifications;
 	if (typeof value.passive === "boolean") normalized.passive = value.passive;
 	if (typeof value.allowCrossProvider === "boolean") normalized.allowCrossProvider = value.allowCrossProvider;
@@ -321,9 +341,36 @@ export function loadConfig(cwd: string, env: NodeJS.ProcessEnv = process.env): C
 		merged.observationsPoolTargetTokens,
 		merged.observationsPoolMaxTokens,
 	) ?? derivedObservationPoolTarget(merged.observationsPoolMaxTokens);
+	const diagnostics: ConfigDiagnostic[] = [];
+	let observerEmptyCoverageCommit = merged.observerEmptyCoverageCommit;
+	let observerChunkMaxTokens = merged.observerChunkMaxTokens;
+
+	if (observerEmptyCoverageCommit && !merged.observerCoverageVerifyModel) {
+		observerEmptyCoverageCommit = false;
+		diagnostics.push({
+			level: "warning",
+			message: "empty-coverage commit requires observerCoverageVerifyModel; disabled",
+		});
+	}
+	if (observerChunkMaxTokens > 0 && !observerEmptyCoverageCommit) {
+		observerChunkMaxTokens = 0;
+		diagnostics.push({
+			level: "warning",
+			message: "bounded batching requires observerEmptyCoverageCommit; falling back to full-chunk",
+		});
+	}
+
+	for (const diagnostic of diagnostics) {
+		// loadConfig intentionally has no UI context. Keep clamps visible in
+		// headless runtimes; an interactive Runtime surfaces the same diagnostics.
+		console.warn(`Observational memory: ${diagnostic.message}`);
+	}
 
 	return {
 		...merged,
+		observerChunkMaxTokens,
+		observerEmptyCoverageCommit,
 		observationsPoolTargetTokens: target,
+		...(diagnostics.length > 0 ? { configDiagnostics: diagnostics } : {}),
 	};
 }

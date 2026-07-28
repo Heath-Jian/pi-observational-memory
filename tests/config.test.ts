@@ -40,6 +40,7 @@ describe("V3 config", () => {
 			observerChunkMaxTokens: 0,
 			observerChunkOverlapEntries: 0,
 			observerChunkOutputReserveTokens: 8000,
+			observerEmptyCoverageCommit: false,
 			reflectAfterTokens: 20000,
 			compactAfterTokens: 81000,
 			compactAfterTokensMode: "calibrated",
@@ -73,6 +74,8 @@ describe("V3 config", () => {
 				observerChunkMaxTokens: 12_000,
 				observerChunkOverlapEntries: 2,
 				observerChunkOutputReserveTokens: 2_000,
+				observerEmptyCoverageCommit: true,
+				observerCoverageVerifyModel: { provider: "openai", id: "verifier", thinking: "minimal" },
 				reflectAfterTokens: 20,
 				compactAfterTokens: 30,
 				observationsPoolMaxTokens: 40,
@@ -108,6 +111,8 @@ describe("V3 config", () => {
 			observerChunkMaxTokens: 12_000,
 			observerChunkOverlapEntries: 2,
 			observerChunkOutputReserveTokens: 2_000,
+			observerEmptyCoverageCommit: true,
+			observerCoverageVerifyModel: { provider: "openai", id: "verifier", thinking: "minimal" },
 			reflectAfterTokens: 20,
 			compactAfterTokens: 30,
 			observationsPoolMaxTokens: 40,
@@ -151,6 +156,62 @@ describe("V3 config", () => {
 		});
 
 		expect(loadConfig(cwd, {})).toEqual(DEFAULTS);
+	});
+
+	it("clamps bounded batching to full-chunk without explicit verified empty commits", () => {
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		writeJson(join(cwd, ".pi", "settings.json"), {
+			"observational-memory": { observerChunkMaxTokens: 64_000 },
+		});
+
+		const config = loadConfig(cwd, {});
+
+		expect(config.observerChunkMaxTokens).toBe(0);
+		expect(config.observerEmptyCoverageCommit).toBe(false);
+		expect(config.configDiagnostics).toEqual([{
+			level: "warning",
+			message: "bounded batching requires observerEmptyCoverageCommit; falling back to full-chunk",
+		}]);
+		expect(warn).toHaveBeenCalledWith(expect.stringContaining("bounded batching requires observerEmptyCoverageCommit"));
+		warn.mockRestore();
+	});
+
+	it("disables commit without a verifier then re-applies the batching gate", () => {
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		writeJson(join(cwd, ".pi", "settings.json"), {
+			"observational-memory": {
+				observerChunkMaxTokens: 64_000,
+				observerEmptyCoverageCommit: true,
+			},
+		});
+
+		const config = loadConfig(cwd, {});
+
+		expect(config.observerEmptyCoverageCommit).toBe(false);
+		expect(config.observerChunkMaxTokens).toBe(0);
+		expect(config.configDiagnostics?.map((diagnostic) => diagnostic.message)).toEqual([
+			"empty-coverage commit requires observerCoverageVerifyModel; disabled",
+			"bounded batching requires observerEmptyCoverageCommit; falling back to full-chunk",
+		]);
+		expect(warn).toHaveBeenCalledTimes(2);
+		warn.mockRestore();
+	});
+
+	it("keeps the valid atomic batching, commit, and verifier combination", () => {
+		writeJson(join(cwd, ".pi", "settings.json"), {
+			"observational-memory": {
+				observerChunkMaxTokens: 64_000,
+				observerEmptyCoverageCommit: true,
+				observerCoverageVerifyModel: { provider: "anthropic", id: "verifier", thinking: "low" },
+			},
+		});
+
+		expect(loadConfig(cwd, {})).toMatchObject({
+			observerChunkMaxTokens: 64_000,
+			observerEmptyCoverageCommit: true,
+			observerCoverageVerifyModel: { provider: "anthropic", id: "verifier", thinking: "low" },
+		});
+		expect(loadConfig(cwd, {}).configDiagnostics).toBeUndefined();
 	});
 
 	it("derives observation pool target from the final max when omitted", () => {

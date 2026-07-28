@@ -1,3 +1,13 @@
+export const OBSERVER_EMPTY_COVERAGE_COMMIT_INSTRUCTIONS = `
+
+Empty-batch coverage protocol (enabled for this run):
+- commit_empty_coverage means exactly: "I fully inspected this batch and found no new content worth recording."
+- Call commit_empty_coverage only when the entire chunk is covered and you have recorded zero valid observations in this run.
+- Never call commit_empty_coverage after record_observations has recorded any valid observation.
+- A valid commit_empty_coverage call ends the run immediately. Do not schedule or call any tool after it.
+- If you recorded one or more observations, do not call commit_empty_coverage; finish with the normal short plain-text confirmation instead.
+- Do not use commit_empty_coverage to report an error, partial review, uncertainty, interruption, or timeout.`;
+
 export const OBSERVER_SYSTEM = `You are the observation agent for a coding assistant.
 
 These records are the ONLY information the assistant will have about past interactions once the raw conversation is compacted out of context. Anything you do not capture here will be forgotten. Anything you distort here will be remembered wrong. Take this seriously.

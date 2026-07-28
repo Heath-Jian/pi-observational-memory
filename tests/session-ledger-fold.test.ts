@@ -33,6 +33,19 @@ describe("session-ledger V3 folding", () => {
 		expect(folded.observationsById.get("bbbbbbbbbbbb")).toBeUndefined();
 	});
 
+	it("accepts covered-empty entries without adding observations to the pool", () => {
+		const entries = [
+			textCustomMessage("raw-1", "routine"),
+			observationsRecordedEntry("om-empty", { observations: [], coversUpToId: "raw-1", covered: true }),
+		];
+
+		const folded = foldLedger(entries);
+
+		expect(folded.observations).toEqual([]);
+		expect(folded.activeObservations).toEqual([]);
+		expect(folded.observationsById.size).toBe(0);
+	});
+
 	it("applies drops as tombstones while preserving observation history", () => {
 		const obs1 = observation("aaaaaaaaaaaa");
 		const obs2 = observation("bbbbbbbbbbbb");

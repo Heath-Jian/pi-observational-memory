@@ -3,6 +3,7 @@ import {
 	OM_OBSERVATIONS_DROPPED,
 	OM_OBSERVATIONS_RECORDED,
 	OM_REFLECTIONS_RECORDED,
+	isObservationsRecordedData,
 	type Entry,
 	type Observation,
 	type V3MemoryCustomType,
@@ -38,7 +39,7 @@ function isValidCoverageEntry(entry: Entry, customType: V3MemoryCustomType): ent
 	if (entry.type !== "custom" || entry.customType !== customType) return false;
 	if (!isObject(entry.data) || typeof entry.data.coversUpToId !== "string") return false;
 
-	if (customType === OM_OBSERVATIONS_RECORDED) return isNonEmptyArray(entry.data.observations);
+	if (customType === OM_OBSERVATIONS_RECORDED) return isObservationsRecordedData(entry.data);
 	if (customType === OM_REFLECTIONS_RECORDED) return isNonEmptyArray(entry.data.reflections);
 	return isNonEmptyArray(entry.data.observationIds);
 }

@@ -215,6 +215,10 @@ A typical config:
 {
   "observational-memory": {
     "observeAfterTokens": 10000,
+    "observerChunkMaxTokens": 0,
+    "observerChunkOverlapEntries": 0,
+    "observerChunkOutputReserveTokens": 8000,
+    "observerEmptyCoverageCommit": false,
     "reflectAfterTokens": 20000,
     "compactAfterTokens": 81000,
     "compactAfterTokensMode": "calibrated",
@@ -244,6 +248,63 @@ A typical config:
 ```
 
 Most users can start with the defaults and tune only if they have a specific reason.
+
+### Bounded observer batching and explicit empty coverage
+
+Bounded batching is atomic with the verified empty-batch protocol. An observer
+that fully checks a batch and finds nothing worth recording calls
+`commit_empty_coverage`; the extension then asks a separately configured model
+to verify the same chunk. Coverage advances only when the verifier returns
+`hasRecordableContent: false`. Verifier lookup, authentication, timeout, call,
+or structured-output failures are fail-closed and do not advance coverage.
+
+A valid bounded configuration is:
+
+```json
+{
+  "observational-memory": {
+    "observerChunkMaxTokens": 64000,
+    "observerChunkOverlapEntries": 0,
+    "observerChunkOutputReserveTokens": 8000,
+    "observerEmptyCoverageCommit": true,
+    "observerCoverageVerifyModel": {
+      "provider": "anthropic",
+      "id": "claude-sonnet-4-5",
+      "thinking": "low"
+    }
+  }
+}
+```
+
+Effective configuration matrix:
+
+| Requested settings | Effective behavior |
+| --- | --- |
+| `observerChunkMaxTokens=0`, commit off, no verifier (defaults) | Full uncovered chunk; legacy behavior is unchanged. |
+| `observerChunkMaxTokens>0`, commit off | Batching is clamped to `0` with a warning. |
+| Commit on, verifier missing/invalid | Commit is disabled with a warning; any requested batching is then clamped to `0`. |
+| Commit on, valid verifier, `observerChunkMaxTokens=0` | Full-chunk observer with verified explicit empty coverage. |
+| Commit on, valid verifier, `observerChunkMaxTokens>0` | Bounded batches with verified explicit empty coverage. |
+
+`/om:status` displays the active verifier and bounded/full-chunk mode whenever
+empty commits are enabled. Clamp warnings are also written to stderr for
+headless runs and shown once when an interactive runtime first receives UI
+context.
+
+**Phase 1 migration:** a previous diagnostic configuration containing only
+`"observerChunkMaxTokens": 64000` now falls back to full-chunk mode. Add both
+`"observerEmptyCoverageCommit": true` and a valid
+`observerCoverageVerifyModel` to restore bounded batching.
+
+The covered-empty ledger event is intentionally not backwards-reader-safe.
+New readers can read old non-empty `om.observations.recorded` events, but old
+readers may ignore a new `{ observations: [], covered: true }` event and repeat
+that source interval. **Minimum reader version: this fork's Phase 2 no-op
+coverage release (`feat/noop-coverage-phase2`) or later.** After the first
+covered-empty write, lossless downgrade to an older reader is unsupported. To
+roll back, remove covered-empty events from the ledger before opening it with
+the old reader, or restore a checkpoint created before those events were
+written.
 
 ### Scaling compaction to the model's context window
 
@@ -287,6 +348,11 @@ on the `Next compaction` line regardless of mode.
 | Setting                     | Default       | Meaning                                                                                           |
 | --------------------------- | ------------- | ------------------------------------------------------------------------------------------------- |
 | `observeAfterTokens`        | `10000`       | Raw/source token threshold for observation runs.                                                  |
+| `observerChunkMaxTokens`    | `0`           | Maximum estimated tokens per observer request; `0` sends the full uncovered range. Values above `0` require commit + verifier. |
+| `observerChunkOverlapEntries` | `0`         | Read-only overlap source entries appended after a bounded batch; never included in its watermark. |
+| `observerChunkOutputReserveTokens` | `8000` | Output allowance reserved within a bounded observer request budget. |
+| `observerEmptyCoverageCommit` | `false`     | Enables explicit empty-batch commits; requires `observerCoverageVerifyModel`. |
+| `observerCoverageVerifyModel` | none        | Required dedicated verifier `{ provider, id, thinking? }`; every empty commit is fail-closed without a valid verdict. |
 | `reflectAfterTokens`        | `20000`       | Legacy raw/source safety threshold for reflection runs.                                             |
 | `reflectAfterObservationTokens` | `2500`  | New active-observation token delta that makes the reflector due.                                    |
 | `reflectAfterObserverBatches` | `2`       | Committed observer batches since reflection that make the reflector due.                            |

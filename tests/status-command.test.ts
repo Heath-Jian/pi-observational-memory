@@ -71,6 +71,42 @@ describe("V3 /om:status", () => {
 		expect(output).not.toContain("pending");
 	});
 
+	it("reports covered-empty progress without adding observations to status counts", async () => {
+		const entries = [
+			textCustomMessage("raw-1", "routine"),
+			observationsRecordedEntry("om-empty", { observations: [], coversUpToId: "raw-1", covered: true }),
+		];
+
+		const output = await setup({ entries }).run();
+
+		expect(output).toContain("Observations: 0 recorded / 0 dropped / 0 active / 0 visible");
+		expect(output).toContain("Next observation: ~0 / 10 tokens (0%)");
+		expect(output).toContain("1 / 2 observer batches");
+	});
+
+	it("shows the active verifier configuration only when empty commits are enabled", async () => {
+		const output = await setup({
+			entries: [],
+			runtime: {
+				config: {
+					observeAfterTokens: 10,
+					observerChunkMaxTokens: 64_000,
+					observerEmptyCoverageCommit: true,
+					observerCoverageVerifyModel: { provider: "anthropic", id: "coverage-verifier" },
+					reflectAfterTokens: 20,
+					compactAfterTokens: 30,
+					observationsPoolMaxTokens: 40,
+					observationsPoolTargetTokens: 20,
+					passive: false,
+				},
+			},
+		}).run();
+
+		expect(output).toContain("── Observer coverage ──");
+		expect(output).toContain("verifier anthropic/coverage-verifier");
+		expect(output).toContain("bounded at 64,000 tokens");
+	});
+
 	it("reports V3 ledger counts, visible/full drift, and ignores old V2 memory", async () => {
 		const obsA = observation("aaaaaaaaaaaa", { tokenCount: 5 });
 		const obsB = observation("bbbbbbbbbbbb", { tokenCount: 7 });

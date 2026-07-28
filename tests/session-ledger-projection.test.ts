@@ -37,6 +37,15 @@ describe("session-ledger V3 projections", () => {
 		expect(projection.reflections.map((ref) => ref.id)).toEqual(["eeeeeeeeeeee"]);
 	});
 
+	it("keeps the observation projection empty for covered-empty ledger entries", () => {
+		const entries = [
+			textCustomMessage("raw-1", "routine"),
+			observationsRecordedEntry("om-empty", { observations: [], coversUpToId: "raw-1", covered: true }),
+		];
+
+		expect(fullProjection(entries)).toEqual({ observations: [], reflections: [] });
+	});
+
 	it("visible projection is empty when there is no V3 compaction", () => {
 		const entries = [
 			textCustomMessage("raw-1", "aaaa"),

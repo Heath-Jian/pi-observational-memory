@@ -4,12 +4,15 @@ import { observationPoolMetrics } from "../agents/dropper/pool.js";
 import {
 	estimateObserverPromptTokens,
 	estimateObserverPromptTokensForChunkCharacters,
+	runCoverageVerifier,
 	runObserver,
+	type CoverageVerifierRunResult,
 	type ObserverRunResult,
 	type ObserverRunStats,
 } from "../agents/observer/agent.js";
 import { runReflector } from "../agents/reflector/agent.js";
 import { getBackgroundBroker, withBackgroundLease } from "../background-broker.js";
+import type { ConfiguredModel } from "../config.js";
 import { debugLog, withDebugLogContext } from "../debug-log.js";
 import { type ConsolidationPhase, type ResolveResult, type Runtime } from "../runtime.js";
 import { serializeSourceAddressedBranchEntries } from "../serialize.js";
@@ -110,6 +113,7 @@ export function selectObserverChunk(args: {
 	maxTokens: number;
 	overlapEntries: number;
 	outputReserveTokens: number;
+	emptyCoverageCommit?: boolean;
 }): ObserverChunkSelection {
 	const configuredBudget = Number.isFinite(args.maxTokens) && args.maxTokens > 0
 		? Math.floor(args.maxTokens)
@@ -127,6 +131,7 @@ export function selectObserverChunk(args: {
 			priorReflections: args.priorReflections,
 			priorObservations: args.priorObservations,
 			chunk: serialized.text,
+			emptyCoverageCommit: args.emptyCoverageCommit,
 		});
 		return {
 			chunk: serialized.text,
@@ -163,6 +168,7 @@ export function selectObserverChunk(args: {
 			priorReflections: args.priorReflections,
 			priorObservations: args.priorObservations,
 			chunkCharacters: prefixCharacterCounts[promptCount] + overlapMarkerCharacters,
+			emptyCoverageCommit: args.emptyCoverageCommit,
 		});
 	};
 	const buildChunk = (sourceCount: number, promptCount: number): string => {
@@ -341,6 +347,16 @@ export function registerConsolidationTrigger(pi: ExtensionAPI, runtime: Runtime)
 	let scheduleTimer: ReturnType<typeof setTimeout> | undefined;
 	let recoveryTimer: ReturnType<typeof setTimeout> | undefined;
 	let lastCtx: ConsolidationCtx | undefined;
+	let configDiagnosticsNotified = false;
+
+	const notifyConfigDiagnostics = (ctx: ConsolidationCtx) => {
+		runtime.ensureConfig(ctx.cwd);
+		if (configDiagnosticsNotified || !ctx.hasUI || !ctx.ui) return;
+		for (const diagnostic of runtime.config.configDiagnostics ?? []) {
+			ctx.ui.notify(`Observational memory: ${diagnostic.message}`, diagnostic.level);
+		}
+		configDiagnosticsNotified = true;
+	};
 
 	const clearSchedule = () => {
 		if (scheduleTimer) clearTimeout(scheduleTimer);
@@ -412,7 +428,9 @@ export function registerConsolidationTrigger(pi: ExtensionAPI, runtime: Runtime)
 		}, Math.max(0, delayMs));
 	};
 
-	pi.on("agent_start", () => {
+	pi.on("agent_start", (_event: any, rawCtx: any) => {
+		const ctx = rawCtx as ConsolidationCtx | undefined;
+		if (ctx) notifyConfigDiagnostics(ctx);
 		getBackgroundBroker().setForegroundActive(true);
 		clearSchedule();
 		if (runtime.consolidationInFlight) runtime.abortConsolidation("foreground activity");
@@ -420,6 +438,7 @@ export function registerConsolidationTrigger(pi: ExtensionAPI, runtime: Runtime)
 	pi.on("agent_end", (event: any, rawCtx: any) => {
 		const ctx = rawCtx as ConsolidationCtx;
 		lastCtx = ctx;
+		notifyConfigDiagnostics(ctx);
 		const lastAssistant = [...event.messages].reverse().find((message: any) => message?.role === "assistant");
 		if (lastAssistant?.stopReason === "aborted" || lastAssistant?.stopReason === "error") {
 			clearSchedule();
@@ -427,7 +446,6 @@ export function registerConsolidationTrigger(pi: ExtensionAPI, runtime: Runtime)
 			return;
 		}
 		getBackgroundBroker().setForegroundActive(false);
-		runtime.ensureConfig(ctx.cwd);
 		schedule(ctx);
 		if (runtime.pendingCompaction) scheduleRecovery(ctx);
 	});
@@ -575,6 +593,37 @@ function isContextOverflowError(error: unknown): boolean {
 	return /context[_ -]?length|maximum context|context window|too many (?:input )?tokens|token limit|input.{0,30}exceed/i.test(errorText(error));
 }
 
+async function resolveCoverageVerifierModel(
+	ctx: ConsolidationCtx,
+	configured: ConfiguredModel | undefined,
+	signal: AbortSignal,
+): Promise<ResolvedModel | { ok: false; reason: string }> {
+	if (!configured) return { ok: false, reason: "observerCoverageVerifyModel is not configured" };
+	let model: unknown;
+	try {
+		model = ctx.modelRegistry?.find?.(configured.provider, configured.id);
+	} catch (error) {
+		return { ok: false, reason: `verifier model lookup failed: ${errorText(error)}` };
+	}
+	if (!model) return { ok: false, reason: `verifier model ${configured.provider}/${configured.id} not found` };
+	if (signal.aborted) return { ok: false, reason: "verifier model resolution aborted" };
+	try {
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+		if (signal.aborted) return { ok: false, reason: "verifier model resolution aborted" };
+		if (!auth?.ok || !auth.apiKey) {
+			return { ok: false, reason: `no API key for verifier provider "${configured.provider}"` };
+		}
+		return {
+			ok: true,
+			model,
+			apiKey: auth.apiKey as string,
+			headers: auth.headers as Record<string, string> | undefined,
+		};
+	} catch (error) {
+		return { ok: false, reason: `verifier model authentication failed: ${errorText(error)}` };
+	}
+}
+
 function observerFailureSubtypes(stats: ObserverRunStats): string[] {
 	if (stats.toolCalls === 0) return ["zero-calls"];
 	const subtypes = ["all-rejected"];
@@ -606,6 +655,7 @@ async function runObserverStage(
 		maxTokens: runtime.config.observerChunkMaxTokens,
 		overlapEntries: runtime.config.observerChunkOverlapEntries,
 		outputReserveTokens: runtime.config.observerChunkOutputReserveTokens,
+		emptyCoverageCommit: runtime.config.observerEmptyCoverageCommit,
 	});
 	const coversUpToId = selection.coversUpToId;
 	if (!coversUpToId || !selection.chunk.trim() || selection.allowedSourceEntryIds.length === 0) return true;
@@ -647,6 +697,7 @@ async function runObserverStage(
 			signal: run.signal,
 			maxTurns: runtime.config.agentMaxTurns,
 			thinkingLevel: runtime.config.model?.thinking ?? "low",
+			emptyCoverageCommit: runtime.config.observerEmptyCoverageCommit,
 			...(selection.configuredBudget > 0
 				? { maxOutputTokens: selection.outputReserveTokens }
 				: {}),
@@ -668,18 +719,95 @@ async function runObserverStage(
 
 	if (!isRunCurrent(runtime, ctx, run)) return false;
 	if (result.observations.length === 0) {
-		const failureSubtypes = observerFailureSubtypes(result.stats);
-		debugLog("observer.empty", {
-			...diagnostics,
-			...result.stats,
-			covered: result.covered,
-			failureSubtype: result.stats.rejected > 0 ? "invalid-ids" : failureSubtypes[0],
-			failureSubtypes,
-			allRejected: true,
-			invalidIds: result.stats.rejected > 0,
-			contextOverflow: false,
+		if (result.covered !== true || !runtime.config.observerEmptyCoverageCommit) {
+			const failureSubtypes = observerFailureSubtypes(result.stats);
+			debugLog("observer.empty", {
+				...diagnostics,
+				...result.stats,
+				covered: result.covered,
+				failureSubtype: result.stats.rejected > 0 ? "invalid-ids" : failureSubtypes[0],
+				failureSubtypes,
+				allRejected: true,
+				invalidIds: result.stats.rejected > 0,
+				contextOverflow: false,
+			});
+			return false;
+		}
+
+		const verifierConfig = runtime.config.observerCoverageVerifyModel;
+		const verificationAudit = {
+			coversUpToId,
+			mainProvider: diagnostics.provider,
+			mainModel: diagnostics.model,
+			verifierProvider: verifierConfig?.provider,
+			verifierModel: verifierConfig?.id,
+			mainStats: result.stats,
+		};
+		const verifierResolved = await resolveCoverageVerifierModel(ctx, verifierConfig, run.signal);
+		if (!verifierResolved.ok) {
+			debugLog("observer.coverage_verification", {
+				...verificationAudit,
+				conclusion: "fail-closed",
+				error: verifierResolved.reason,
+			});
+			debugLog("observer.empty", {
+				...diagnostics,
+				...result.stats,
+				covered: false,
+				failureSubtype: "verifier-model-unavailable",
+				error: verifierResolved.reason,
+				contextOverflow: false,
+			});
+			return false;
+		}
+
+		let verification: CoverageVerifierRunResult | undefined;
+		let verificationError: string | undefined;
+		try {
+			verification = await runCoverageVerifier({
+				model: verifierResolved.model as any,
+				apiKey: verifierResolved.apiKey,
+				headers: verifierResolved.headers,
+				chunk: selection.chunk,
+				signal: run.signal,
+				thinkingLevel: verifierConfig?.thinking ?? "low",
+			});
+		} catch (error) {
+			verificationError = errorText(error);
+		}
+		const verdict = verification?.verdict;
+		const accepted = verdict?.hasRecordableContent === false;
+		debugLog("observer.coverage_verification", {
+			...verificationAudit,
+			verifierStats: verification?.stats,
+			conclusion: accepted
+				? "accepted-empty"
+				: verdict?.hasRecordableContent === true ? "disagreement" : "fail-closed",
+			hasRecordableContent: verdict?.hasRecordableContent,
+			reason: verdict?.reason,
+			error: verificationError ?? (!verdict ? "verifier produced no valid structured verdict" : undefined),
 		});
-		return false;
+		if (!isRunCurrent(runtime, ctx, run)) return false;
+		if (!accepted) {
+			debugLog("observer.empty", {
+				...diagnostics,
+				...result.stats,
+				covered: false,
+				failureSubtype: verdict?.hasRecordableContent === true ? "verifier-disagreement" : "verifier-failed",
+				verifierStats: verification?.stats,
+				reason: verdict?.reason,
+				error: verificationError,
+				contextOverflow: false,
+			});
+			return false;
+		}
+		const data = buildObservationsRecordedData([], coversUpToId, true);
+		if (!data) return false;
+		appendEntry(pi, OM_OBSERVATIONS_RECORDED, data);
+		if (shouldNotifyWorker(runtime, ctx)) {
+			ctx.ui?.notify("Observational memory: empty observer batch verified and covered", "info");
+		}
+		return true;
 	}
 	const data = buildObservationsRecordedData(result.observations, coversUpToId);
 	if (!data) {

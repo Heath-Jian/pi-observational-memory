@@ -77,6 +77,20 @@ describe("session-ledger V3 progress helpers", () => {
 		expect(rawTokensSinceDropCoverage(entries)).toBe(7); // covers ledger entry om-eeeeeeeeeeee, raw after it
 	});
 
+	it("advances observation coverage clocks for a covered-empty marker", () => {
+		const entries = [
+			textCustomMessage("raw-1", "aaaa"),
+			observationsRecordedEntry("om-empty", { observations: [], coversUpToId: "raw-1", covered: true }),
+			textCustomMessage("raw-2", "bbbbbbbb"),
+		];
+
+		expect(latestCoverageIndex(entries, V3_OBSERVATIONS_RECORDED)).toBe(0);
+		expect(latestCoverageMarkerId(entries, V3_OBSERVATIONS_RECORDED)).toBe("raw-1");
+		expect(rawTokensSinceObservationCoverage(entries)).toBe(2);
+		expect(observerBatchesSinceReflectionCoverage(entries)).toBe(1);
+		expect(observationCoverageIncludesCompactionPrefix(entries, "raw-2")).toBe(true);
+	});
+
 	it("measures reflection progress from observation tokens and committed observer batches", () => {
 		const obsA = observation("aaaaaaaaaaaa", { sourceEntryIds: ["raw-1"], tokenCount: 5 });
 		const obsB = observation("bbbbbbbbbbbb", { sourceEntryIds: ["raw-2"], tokenCount: 7 });

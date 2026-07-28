@@ -41,6 +41,8 @@ export type Reflection = {
 export type ObservationsRecordedEntryData = {
 	observations: Observation[];
 	coversUpToId: string;
+	/** True only for an explicitly verified empty-batch coverage commit. */
+	covered?: boolean;
 };
 
 export type ReflectionsRecordedEntryData = {
@@ -115,12 +117,10 @@ export function isReflection(value: unknown): value is Reflection {
 
 export function isObservationsRecordedData(value: unknown): value is ObservationsRecordedEntryData {
 	if (!isPlainRecord(value)) return false;
-	return (
-		Array.isArray(value.observations) &&
-		value.observations.length > 0 &&
-		value.observations.every(isObservation) &&
-		isNonEmptyString(value.coversUpToId)
-	);
+	if (value.covered !== undefined && typeof value.covered !== "boolean") return false;
+	if (!Array.isArray(value.observations) || !value.observations.every(isObservation)) return false;
+	const isEmpty = value.observations.length === 0;
+	return isEmpty === (value.covered === true) && isNonEmptyString(value.coversUpToId);
 }
 
 export function isReflectionsRecordedData(value: unknown): value is ReflectionsRecordedEntryData {
@@ -178,9 +178,11 @@ export function isObservationsDroppedEntry(entry: Entry): entry is Entry & {
 export function buildObservationsRecordedData(
 	observations: Observation[],
 	coversUpToId: string,
+	covered = false,
 ): ObservationsRecordedEntryData | undefined {
-	if (observations.length === 0 || !isNonEmptyString(coversUpToId)) return undefined;
-	return { observations, coversUpToId };
+	if (!isNonEmptyString(coversUpToId)) return undefined;
+	if ((observations.length === 0) !== (covered === true)) return undefined;
+	return covered ? { observations, coversUpToId, covered: true } : { observations, coversUpToId };
 }
 
 export function buildReflectionsRecordedData(

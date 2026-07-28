@@ -1,16 +1,24 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const mockObserver = vi.hoisted(() => vi.fn());
+const mocks = vi.hoisted(() => ({ observer: vi.fn(), verifier: vi.fn() }));
 
 vi.mock("../src/agents/observer/agent.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../src/agents/observer/agent.js")>()),
-	runObserver: mockObserver,
+	runObserver: mocks.observer,
+	runCoverageVerifier: mocks.verifier,
 }));
 
 import { registerCompactionHook } from "../src/hooks/compaction-hook.js";
 import { registerCompactionTrigger } from "../src/hooks/compaction-trigger.js";
 import { registerConsolidationTrigger } from "../src/hooks/consolidation-trigger.js";
 import { Runtime } from "../src/runtime.js";
+import {
+	foldLedger,
+	isSourceEntry,
+	latestCoverageMarkerId,
+	OM_OBSERVATIONS_RECORDED,
+	rawTokensSinceObservationCoverage,
+} from "../src/session-ledger/index.js";
 import { observation, textCustomMessage, type TestEntry } from "./fixtures/session.js";
 
 type Handler = (event: any, ctx: any) => unknown | Promise<unknown>;
@@ -60,6 +68,8 @@ function setup() {
 		compactionWaitForConsolidationMs: 50,
 		observerTimeoutMs: 1_000,
 		debugLog: false,
+		observerEmptyCoverageCommit: true,
+		observerCoverageVerifyModel: { provider: "openai-codex", id: "coverage-verifier", thinking: "off" },
 		model: { provider: "openai-codex", id: "gpt-5.6-sol", thinking: "off" },
 	};
 	vi.spyOn(runtime, "resolveModel").mockResolvedValue({
@@ -74,7 +84,10 @@ function setup() {
 		hasUI: true,
 		ui: { notify: vi.fn() },
 		model: { provider: "openai-codex", contextWindow: 272_000 },
-		modelRegistry: {},
+		modelRegistry: {
+			find: vi.fn((provider: string, id: string) => ({ provider, id })),
+			getApiKeyAndHeaders: vi.fn(async () => ({ ok: true, apiKey: "verifier-key" })),
+		},
 		isIdle: vi.fn(() => true),
 		hasPendingMessages: vi.fn(() => pendingMessages),
 		sessionManager: {
@@ -149,14 +162,33 @@ function setup() {
 		setPendingMessages(value: boolean) {
 			pendingMessages = value;
 		},
+		appendSource(id: string, text: string) {
+			entries = [...entries, textCustomMessage(id, text)];
+		},
 		getEntries: () => entries,
 	};
+}
+
+function expectNoUnrecoverableUncoveredBoundary(
+	before: TestEntry[],
+	after: TestEntry[],
+	coverageMarkerId?: string,
+): void {
+	const markerIndex = coverageMarkerId ? before.findIndex((entry) => entry.id === coverageMarkerId) : -1;
+	const uncovered = before.slice(markerIndex + 1).filter(isSourceEntry);
+	const afterById = new Map(after.map((entry) => [entry.id, entry]));
+	for (const source of uncovered) {
+		// Covered history before the marker may be compacted normally. The oracle
+		// only rejects crossing an uncovered boundary that would make replay impossible.
+		expect(afterById.get(source.id)).toEqual(source);
+	}
 }
 
 describe("compaction recovery integration", () => {
 	beforeEach(() => {
 		vi.useFakeTimers();
-		mockObserver.mockReset();
+		mocks.observer.mockReset();
+		mocks.verifier.mockReset().mockResolvedValue({ stats: { toolCalls: 0, toolErrors: 0, stopReason: "stop" } });
 	});
 
 	afterEach(() => {
@@ -165,7 +197,7 @@ describe("compaction recovery integration", () => {
 
 	it("coalesces repeated agent_end events until observer coverage is ready", async () => {
 		let releaseObserver: ((value: unknown) => void) | undefined;
-		mockObserver.mockImplementation(() => new Promise((resolve) => {
+		mocks.observer.mockImplementation(() => new Promise((resolve) => {
 			releaseObserver = resolve;
 		}));
 		const subject = setup();
@@ -194,7 +226,7 @@ describe("compaction recovery integration", () => {
 
 	it("keeps a ready retry alive while follow-up messages are pending", async () => {
 		let releaseObserver: ((value: unknown) => void) | undefined;
-		mockObserver.mockImplementation(() => new Promise((resolve) => {
+		mocks.observer.mockImplementation(() => new Promise((resolve) => {
 			releaseObserver = resolve;
 		}));
 		const subject = setup();
@@ -219,11 +251,12 @@ describe("compaction recovery integration", () => {
 		expect(subject.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
 	});
 
-	it("fails open exactly once when the coverage grace deadline expires", async () => {
-		mockObserver.mockImplementation(({ signal }: { signal: AbortSignal }) => new Promise((_resolve, reject) => {
+	it("keeps every uncovered source replayable when the coverage grace deadline releases compaction (I1/I3)", async () => {
+		mocks.observer.mockImplementation(({ signal }: { signal: AbortSignal }) => new Promise((_resolve, reject) => {
 			signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
 		}));
 		const subject = setup();
+		const before = subject.getEntries();
 
 		await subject.fireAgentEnd();
 		await subject.advance(1);
@@ -235,18 +268,20 @@ describe("compaction recovery integration", () => {
 		expect(subject.ctx.compact).toHaveBeenCalledTimes(2);
 		expect(subject.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
 		expect(subject.runtime.pendingCompaction).toBeUndefined();
+		expectNoUnrecoverableUncoveredBoundary(before, subject.getEntries());
 		await subject.advance(100);
 		expect(subject.ctx.compact).toHaveBeenCalledTimes(2);
 	});
 
-	it("fails open when the observer circuit opens", async () => {
-		mockObserver.mockRejectedValue(new Error("observer unavailable"));
+	it("keeps every uncovered source replayable when observer failure opens the circuit (I1/I3)", async () => {
+		mocks.observer.mockRejectedValue(new Error("observer unavailable"));
 		const subject = setup();
+		const before = subject.getEntries();
 		subject.runtime.config.consolidationCircuitBreakerFailures = 1;
 
 		await subject.fireAgentEnd();
 		await subject.advance(5);
-		expect(mockObserver).toHaveBeenCalledTimes(1);
+		expect(mocks.observer).toHaveBeenCalledTimes(1);
 		await vi.waitFor(() => expect(
 			subject.runtime.stageFailureStatus("observer")?.circuitOpenUntil,
 		).toBeTypeOf("number"));
@@ -255,5 +290,43 @@ describe("compaction recovery integration", () => {
 		expect(subject.ctx.compact).toHaveBeenCalledTimes(2);
 		expect(subject.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(1);
 		expect(subject.runtime.pendingCompaction).toBeUndefined();
+		expectNoUnrecoverableUncoveredBoundary(before, subject.getEntries());
+	});
+
+	it("restores a covered-empty marker after compaction and resumes strictly after it (I2/I3)", async () => {
+		mocks.observer.mockResolvedValueOnce({
+			observations: [],
+			covered: true,
+			stats: { toolCalls: 1, added: 0, duplicate: 0, rejected: 0, stopReason: "empty-coverage-commit" },
+		});
+		mocks.verifier.mockResolvedValueOnce({
+			verdict: { hasRecordableContent: false, reason: "No recordable content." },
+			stats: { toolCalls: 1, toolErrors: 0, stopReason: "toolUse" },
+		});
+		const subject = setup();
+
+		await subject.fireAgentEnd();
+		await subject.advance(10);
+		await vi.waitFor(() => expect(subject.getEntries().some((entry) => entry.type === "compaction")).toBe(true));
+
+		const restartedEntries = subject.getEntries();
+		expect(latestCoverageMarkerId(restartedEntries as any, OM_OBSERVATIONS_RECORDED)).toBe("raw-2");
+		expect(foldLedger(restartedEntries as any).activeObservations).toEqual([]);
+		expect(rawTokensSinceObservationCoverage(restartedEntries as any)).toBe(0);
+
+		subject.appendSource("raw-3", "cccccccc");
+		subject.runtime.config.observeAfterTokens = 1;
+		const beforeReplay = subject.getEntries();
+		expectNoUnrecoverableUncoveredBoundary(beforeReplay, subject.getEntries(), "raw-2");
+		mocks.observer.mockResolvedValueOnce([
+			observation("bbbbbbbbbbbb", { sourceEntryIds: ["raw-3"], tokenCount: 2 }),
+		]);
+		await subject.fireAgentEnd();
+		await subject.advance(5);
+		await vi.waitFor(() => expect(mocks.observer).toHaveBeenCalledTimes(2));
+		const replayChunk = mocks.observer.mock.calls[1][0].chunk as string;
+		expect(replayChunk).toContain("raw-3");
+		expect(replayChunk).not.toContain("raw-1");
+		expect(replayChunk).not.toContain("raw-2");
 	});
 });

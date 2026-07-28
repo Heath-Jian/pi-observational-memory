@@ -85,9 +85,18 @@ export function registerStatusCommand(pi: ExtensionAPI, runtime: Runtime): void 
 					"",
 				]
 				: [];
+			const verifier = runtime.config.observerCoverageVerifyModel;
+			const coverageModeLines = runtime.config.observerEmptyCoverageCommit && verifier
+				? [
+					"── Observer coverage ──",
+					`Empty-batch commit: enabled; verifier ${verifier.provider}/${verifier.id}; batching ${runtime.config.observerChunkMaxTokens > 0 ? `bounded at ${runtime.config.observerChunkMaxTokens.toLocaleString()} tokens` : "full-chunk"}`,
+					"",
+				]
+				: [];
 
 			const lines = [
 				...passiveLines,
+				...coverageModeLines,
 				"── Memory ──",
 				observationLine,
 				reflectionLine,

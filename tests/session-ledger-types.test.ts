@@ -60,14 +60,26 @@ describe("session-ledger V3 type guards and builders", () => {
 		expect(isObservationsDroppedData(dropData)).toBe(true);
 	});
 
-	it("rejects empty ledger entry data so no empty progress entries can be appended", () => {
+	it("enforces covered iff observations are empty while preserving old non-empty events", () => {
+		expect(isObservationsRecordedData({ observations: [], coversUpToId: "raw-1", covered: true })).toBe(true);
 		expect(isObservationsRecordedData({ observations: [], coversUpToId: "raw-1" })).toBe(false);
+		expect(isObservationsRecordedData({ observations: [], coversUpToId: "raw-1", covered: false })).toBe(false);
+		expect(isObservationsRecordedData({ observations: [observation("aaaaaaaaaaaa")], coversUpToId: "raw-1" })).toBe(true);
+		expect(isObservationsRecordedData({ observations: [observation("aaaaaaaaaaaa")], coversUpToId: "raw-1", covered: false })).toBe(true);
+		expect(isObservationsRecordedData({ observations: [observation("aaaaaaaaaaaa")], coversUpToId: "raw-1", covered: true })).toBe(false);
+		expect(isObservationsRecordedData({ observations: [], coversUpToId: "raw-1", covered: "true" })).toBe(false);
 		expect(isReflectionsRecordedData({ reflections: [], coversUpToId: "raw-1" })).toBe(false);
 		expect(isObservationsDroppedData({ observationIds: [], coversUpToId: "raw-1" })).toBe(false);
 	});
 
-	it("builders return undefined for empty arrays and data for non-empty arrays", () => {
+	it("builders require explicit covered=true for empty observation batches", () => {
 		expect(buildObservationsRecordedData([], "raw-1")).toBeUndefined();
+		expect(buildObservationsRecordedData([], "raw-1", true)).toEqual({
+			observations: [],
+			coversUpToId: "raw-1",
+			covered: true,
+		});
+		expect(buildObservationsRecordedData([observation("aaaaaaaaaaaa")], "raw-1", true)).toBeUndefined();
 		expect(buildReflectionsRecordedData([], "raw-1")).toBeUndefined();
 		expect(buildObservationsDroppedData([], "raw-1")).toBeUndefined();
 
@@ -86,6 +98,11 @@ describe("session-ledger V3 type guards and builders", () => {
 	});
 
 	it("recognizes V3 memory entries", () => {
+		expect(isObservationsRecordedEntry(observationsRecordedEntry("om-empty", {
+			observations: [],
+			coversUpToId: "raw-1",
+			covered: true,
+		}))).toBe(true);
 		expect(isObservationsRecordedEntry(observationsRecordedEntry("om-aaaaaaaaaaaa", {
 			observations: [observation("aaaaaaaaaaaa")],
 			coversUpToId: "raw-1",
