@@ -3,9 +3,6 @@ import { resolveCompactAfterTokens } from "../config.js";
 import { rawTokensSinceLastCompaction, type Entry } from "../session-ledger/index.js";
 import type { Runtime } from "../runtime.js";
 
-const RETRYABLE_ERROR_RE =
-	/overloaded|provider.?returned.?error|rate.?limit|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|connection.?lost|websocket.?closed|websocket.?error|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|ended without|http2 request did not get a response|timed? out|timeout|terminated|retry delay/i;
-
 const COMPACTION_CANCEL_COOLDOWN_MS = 15_000;
 
 type CompactionCtx = {
@@ -41,10 +38,11 @@ function compactionThreshold(runtime: Runtime, ctx: CompactionCtx): number {
 export function requestCompaction(
 	runtime: Runtime,
 	ctx: CompactionCtx,
-	options: { force?: boolean } = {},
+	options: { force?: boolean; canRun?: () => boolean } = {},
 ): void {
 	runtime.ensureConfig(ctx.cwd);
 	if (runtime.config.passive || runtime.compactInFlight) return;
+	if (options.canRun && !options.canRun()) return;
 
 	const entries = ctx.sessionManager.getBranch() as Entry[];
 	const boundaryKey = latestCompactionBoundaryKey(entries);
@@ -61,17 +59,15 @@ export function requestCompaction(
 	}
 
 	const currentPending = runtime.pendingCompaction;
-	const force = options.force === true
-		|| currentPending?.state === "ready"
-		|| (!!currentPending && !runtime.isDeferredGraceActive(now));
+	if (currentPending?.state === "blocked") return;
+	const force = currentPending?.state === "ready"
+		&& (options.force === true || !runtime.isDeferredGraceActive(now));
 
 	if (options.force && !currentPending) return;
+	if (options.force && currentPending?.state !== "ready") return;
 	if (currentPending && !force) return;
 	if (!force && runtime.compactionCancelCooldownUntil > now) return;
-	if (tokens < threshold) {
-		if (currentPending) runtime.clearCompactionDeferral();
-		return;
-	}
+	if (!force && tokens < threshold) return;
 
 	if (ctx.hasUI) ctx.ui?.notify(
 		force
@@ -88,6 +84,10 @@ export function requestCompaction(
 
 		try {
 			if (!runtime.isLifecycleCurrent(lifecycleGeneration)) return;
+			if (options.canRun && !options.canRun()) {
+				releaseScheduledAttempt();
+				return;
+			}
 			if (runtime.config.passive) {
 				runtime.clearCompactionState();
 				return;
@@ -124,8 +124,7 @@ export function requestCompaction(
 
 			const currentTokens = rawTokensSinceLastCompaction(currentEntries);
 			const currentThreshold = compactionThreshold(runtime, ctx);
-			if (currentTokens < currentThreshold) {
-				if (deferred) runtime.clearCompactionDeferral();
+			if (!force && currentTokens < currentThreshold) {
 				releaseScheduledAttempt();
 				if (ctx.hasUI) ctx.ui?.notify("Observational memory: compaction skipped — another compaction already ran before deferred compaction", "info");
 				return;
@@ -148,16 +147,21 @@ export function requestCompaction(
 					runtime.compactInFlight = false;
 					if (error.message === "Compaction cancelled") {
 						if (attempt.kind === "force") {
-							runtime.clearCompactionDeferral();
-							runtime.setCompactionCancelCooldown(COMPACTION_CANCEL_COOLDOWN_MS);
+							if (!runtime.pendingCompaction) {
+								runtime.setCompactionCancelCooldown(COMPACTION_CANCEL_COOLDOWN_MS);
+							}
 						} else if (!runtime.compactionDeferred) {
 							runtime.setCompactionCancelCooldown(COMPACTION_CANCEL_COOLDOWN_MS);
 						}
 						return;
 					}
 					if (attempt.kind === "force") {
-						runtime.clearCompactionDeferral();
-						runtime.setCompactionCancelCooldown(COMPACTION_CANCEL_COOLDOWN_MS);
+						if (runtime.pendingCompaction?.strict) {
+							runtime.blockCompactionRecovery(error.message);
+						} else {
+							runtime.clearCompactionDeferral();
+							runtime.setCompactionCancelCooldown(COMPACTION_CANCEL_COOLDOWN_MS);
+						}
 					}
 					if (ctx.hasUI) ctx.ui?.notify(`Observational memory: ${error.message}`, "error");
 				},
@@ -168,8 +172,12 @@ export function requestCompaction(
 			if (activeAttempt) {
 				runtime.finishCompactionAttempt(activeAttempt.id);
 				if (activeAttempt.kind === "force") {
-					runtime.clearCompactionDeferral();
-					runtime.setCompactionCancelCooldown(COMPACTION_CANCEL_COOLDOWN_MS);
+					if (runtime.pendingCompaction?.strict) {
+						runtime.blockCompactionRecovery(error instanceof Error ? error.message : String(error));
+					} else {
+						runtime.clearCompactionDeferral();
+						runtime.setCompactionCancelCooldown(COMPACTION_CANCEL_COOLDOWN_MS);
+					}
 				}
 			}
 			releaseScheduledAttempt();
@@ -180,6 +188,8 @@ export function requestCompaction(
 }
 
 export function registerCompactionTrigger(pi: ExtensionAPI, runtime: Runtime): void {
+	let compactWhenSettledGeneration: number | undefined;
+
 	pi.events.on("pi-convergence:state", (event: any) => {
 		const phase = event?.phase;
 		if (phase === "aborted") {
@@ -189,17 +199,19 @@ export function registerCompactionTrigger(pi: ExtensionAPI, runtime: Runtime): v
 		runtime.convergenceControlInFlight = phase === "judging" || phase === "continuation";
 	});
 
-	pi.on("agent_end", (event: any, ctx: CompactionCtx) => {
+	pi.on("agent_end", (event: any) => {
 		const lastAssistant = [...event.messages].reverse().find(
 			(message): message is Extract<typeof message, { role: "assistant" }> => message.role === "assistant",
 		);
-		if (lastAssistant?.stopReason === "aborted") return;
-		if (
-			lastAssistant
-			&& lastAssistant.stopReason === "error"
-			&& lastAssistant.errorMessage
-			&& RETRYABLE_ERROR_RE.test(lastAssistant.errorMessage)
-		) return;
+		compactWhenSettledGeneration = lastAssistant?.stopReason === "aborted"
+			? undefined
+			: runtime.lifecycleGeneration;
+	});
+
+	pi.on("agent_settled", (_event: any, ctx: CompactionCtx) => {
+		const generation = compactWhenSettledGeneration;
+		compactWhenSettledGeneration = undefined;
+		if (generation === undefined || !runtime.isLifecycleCurrent(generation)) return;
 		requestCompaction(runtime, ctx);
 	});
 }

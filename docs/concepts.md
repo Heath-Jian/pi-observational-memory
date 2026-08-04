@@ -70,9 +70,9 @@ Dropping does not delete history. Dropped observations remain recallable from le
 
 ### Observer
 
-The observer runs asynchronously after a successful `agent_end` and idle delay when raw/source tokens after the latest observation coverage marker reach `observeAfterTokens`. A compaction coverage gap may force it below the normal threshold.
+The observer runs asynchronously after `agent_settled` and an idle delay, when raw/source tokens after the latest observation coverage marker reach `observeAfterTokens`. `agent_settled` is later than Pi's automatic retry, compaction/retry, and queued continuations. A pending compaction coverage target may force observer batches below the normal threshold until that exact cut is covered.
 
-It receives raw/source entries only, validates source ids, and appends a non-empty `om.observations.recorded` entry. If there is nothing worth recording, it writes no entry and the raw range remains eligible for a later observer run.
+It receives raw/source entries only, validates source ids, and appends a non-empty `om.observations.recorded` entry. If there is nothing worth recording, it normally writes no entry and the raw range remains eligible for a later observer run. When explicit empty-coverage commit is enabled, a dedicated verifier may instead approve a covered-empty marker so bounded recovery can advance safely.
 
 ### Reflector
 

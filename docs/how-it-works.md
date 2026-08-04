@@ -11,10 +11,11 @@ V3 is ledger-centered: memory state is reconstructed by folding V3 ledger entrie
 | Surface | Purpose |
 |---|---|
 | `agent_start` foreground gate | Abort background model work so it cannot compete with the active response. |
-| `agent_end` single-stage scheduler | After an idle delay, run at most one due observer, reflector, or dropper stage. |
-| `agent_end` compaction trigger | Maybe call `ctx.compact()` when idle and over `compactAfterTokens`. |
+| `agent_settled` single-stage scheduler | After Pi finishes retry/compaction/continuation work and an idle delay, run at most one due observer, reflector, or dropper stage. |
+| `agent_settled` compaction trigger | Maybe call `ctx.compact()` when idle and over `compactAfterTokens`. |
 | `session_before_compact` hook | Build the V3 compaction payload deterministically. |
 | `/om:status` | Show ledger counts, drift, progress clocks, and worker state. |
+| `/om:recover` | Explicitly restart or wake an existing pending compaction recovery. |
 | `/om:view` | Show visible or full memory content and attempt to copy the rendered memory text. |
 | `recall` tool | Recover source evidence for a memory id. |
 
@@ -23,7 +24,7 @@ V3 is ledger-centered: memory state is reconstructed by folding V3 ledger entrie
 ```mermaid
 flowchart TD
     AS[agent_start]
-    AE[agent_end]
+    Settled[agent_settled]
     SBC[session_before_compact]
 
     Abort[Abort active background lease]
@@ -37,7 +38,8 @@ flowchart TD
     CompactDue{raw tokens since compaction<br/>≥ compactAfterTokens<br/>and idle?}
     CompactCall[ctx.compact]
     Covered{Observer covers source prefix<br/>selected for removal?}
-    Defer[Defer once and force observer]
+    Defer[Create or merge pending cut and force observer]
+    Blocked[Strict recovery blocked<br/>raw history retained]
     Native[Pi native compaction fallback]
 
     Fold[fold/project V3 ledger]
@@ -45,7 +47,7 @@ flowchart TD
     Details[return om.folded details]
 
     AS --> Abort
-    AE --> Idle --> Due
+    Settled --> Idle --> Due
     Due -- observer --> Observer --> Idle
     Due -- reflector --> Reflector --> Idle
     Due -- dropper --> Dropper --> Idle
@@ -53,12 +55,13 @@ flowchart TD
     Reflector -. failure .-> Backoff
     Dropper -. failure .-> Backoff
 
-    AE --> CompactDue
+    Settled --> CompactDue
     CompactDue -- yes --> CompactCall
     CompactCall --> SBC --> Covered
     Covered -- yes --> Fold --> Render --> Details
-    Covered -- first miss --> Defer --> Idle
-    Covered -- repeated miss/failure --> Native
+    Covered -- miss --> Defer --> Idle
+    Defer -. fallback enabled effective budget .-> Native
+    Defer -. strict effective budget or circuit .-> Blocked
 ```
 
 The observer has priority, followed by reflector and dropper. Each stage commits separately;
@@ -163,7 +166,7 @@ These details are what later visible projections read. The ledger remains the so
 
 ## Observer flow
 
-The observer trigger is evaluated after a successful `agent_end` and idle delay.
+The observer trigger is evaluated after `agent_settled` and the idle delay.
 
 1. Load config if needed.
 2. Skip if `passive` is true.
@@ -178,7 +181,7 @@ The observer trigger is evaluated after a successful `agent_end` and idle delay.
 11. Compute deterministic 12-character ids and per-observation token counts in code.
 12. Append `om.observations.recorded` only if at least one observation was accepted.
 
-If no observations are generated, the worker writes no entry and does not advance coverage. A later eligible observer run will see a larger range.
+If no observations are generated, the worker normally writes no entry and does not advance coverage. When empty-coverage commit is enabled, a dedicated verifier may instead approve a covered-empty marker; otherwise a later eligible observer run sees a larger range.
 
 ## Reflect/drop flow
 
@@ -194,15 +197,26 @@ Reflector and dropper are independent single-stage tasks evaluated after observe
 
 No-output and failures are retryable stage failures. They do not roll back prior checkpoints and do not cause the scheduler to spin on the same watermark.
 
+When `pi-convergence` is active and observation work is due, observational memory uses
+the neutral `pi-coordination:checkpoint-*` event protocol to reserve a stable ledger
+prefix. The request binds the OM lifecycle generation, compaction boundary, immutable
+target entry, and a coordinator-issued lease. Convergence holds new control messages
+until the observer covers that target. Routine observation releases immediately after
+the target is covered; strict recovery holds the lease through the successful
+`session_compact` event so a continuation cannot interrupt the final force compaction.
+User input or session/branch changes preempt the lease and abort background work without
+discarding the strict pending target.
+
 ## Auto-compaction trigger
 
-The auto-compaction trigger runs on `agent_end`.
+The auto-compaction trigger records the latest low-level outcome on `agent_end`
+and runs on `agent_settled`, after automatic retry, automatic compaction/retry,
+and queued continuations are exhausted.
 
 It skips when:
 
 - `passive` is true;
 - compaction is already in flight;
-- the agent end event is a retryable error;
 - raw/source tokens since last compaction are below `compactAfterTokens`;
 - Pi is not idle after the deferred check;
 - the threshold is no longer met after the deferred check.
@@ -221,15 +235,18 @@ It does only deterministic work:
 2. Load config if needed.
 3. Read the current branch and `event.preparation.firstKeptEntryId`.
 4. Verify that committed observation coverage includes every source entry before the cut.
-5. If coverage is missing on an OM-owned proactive request, defer once and start
-   a boundary-scoped recovery window. Ordinary `agent_end` retries are coalesced
-   while the observer catches up.
-6. Observer success retries once when Pi is idle. Busy, queued-message, and
-   convergence states preserve and reschedule that retry instead of dropping it.
-7. If the fixed recovery grace expires, the observer circuit opens, or coverage
-   is still missing on the forced retry, fail open to Pi native compaction.
-8. Native threshold/overflow compaction, passive mode, and explicit user
-   compaction are never delayed for observer coverage.
+5. If coverage is missing, create or merge a boundary-scoped pending target for
+   proactive, manual, threshold, or overflow compaction.
+6. Recovery bypasses the ordinary observation threshold. After every bounded
+   observer batch it verifies the pending cut; partial success remains waiting.
+7. When coverage is complete and Pi is idle, retry compaction even when raw
+   tokens are below the automatic compaction threshold.
+8. With native fallback enabled, the existing fail-open recovery-budget behavior is
+   preserved for the proactive trigger, while native manual/threshold/overflow
+   gaps fail open immediately. With fallback disabled, all four origins use
+   strict recovery; effective-budget exhaustion or circuit failure becomes `blocked`, preserves raw
+   history, and stops automatic retries. Strict recovery never substitutes the
+   active session model for an unavailable configured memory model.
 9. If coverage is sufficient, abort stale background work and build the projection immediately.
 10. Render and return `{ compaction: { summary, firstKeptEntryId, tokensBefore, details } }` where `details.type` is `om.folded`.
 
@@ -302,6 +319,15 @@ Shows:
 - passive mode;
 - worker in-flight flags;
 - last observer and reflect/drop errors.
+
+Blocked compaction recovery also shows its origin, cut, boundary, last error,
+and the `/om:recover` action.
+
+### `/om:recover`
+
+Restarts or wakes only the existing recovery target on the current lifecycle
+and compaction boundary. It does not infer a new cut, change fallback policy, or
+call native compaction directly.
 
 ### `/om:view`
 

@@ -52,6 +52,71 @@ describe("Runtime V3 behavior", () => {
 		);
 	});
 
+	it("never falls back to the session model during strict recovery when no memory model is configured", async () => {
+		const runtime = new Runtime();
+		const registry = modelRegistry();
+		runtime.deferCompaction("raw-2", "root", { origin: "manual", strict: true });
+
+		const result = await runtime.resolveModel({
+			model: { provider: "openai", id: "session" },
+			modelRegistry: registry,
+			hasUI: false,
+		});
+
+		expect(result).toEqual({
+			ok: false,
+			reason: "strict compaction recovery requires a configured observational-memory model",
+		});
+		expect(registry.getApiKeyAndHeaders).not.toHaveBeenCalled();
+	});
+
+	it("never falls back to the session model when the configured strict recovery model is unavailable", async () => {
+		const runtime = new Runtime();
+		const registry = modelRegistry();
+		runtime.config = {
+			...runtime.config,
+			model: { provider: "anthropic", id: "missing" },
+			allowCrossProvider: true,
+		};
+		runtime.deferCompaction("raw-2", "root", { origin: "overflow", strict: true });
+
+		const result = await runtime.resolveModel({
+			model: { provider: "openai", id: "session" },
+			modelRegistry: registry,
+			hasUI: false,
+		});
+
+		expect(result).toEqual({
+			ok: false,
+			reason: "configured strict recovery model anthropic/missing was not found",
+		});
+		expect(registry.getApiKeyAndHeaders).not.toHaveBeenCalled();
+	});
+
+	it("fails closed before lookup when strict recovery cross-provider access is disabled", async () => {
+		const runtime = new Runtime();
+		const registry = modelRegistry({ found: { provider: "anthropic", id: "memory" } });
+		runtime.config = {
+			...runtime.config,
+			model: { provider: "anthropic", id: "memory" },
+			allowCrossProvider: false,
+		};
+		runtime.deferCompaction("raw-2", "root", { origin: "threshold", strict: true });
+
+		const result = await runtime.resolveModel({
+			model: { provider: "openai", id: "session" },
+			modelRegistry: registry,
+			hasUI: false,
+		});
+
+		expect(result).toEqual({
+			ok: false,
+			reason: "strict compaction recovery cannot use cross-provider model anthropic/memory while allowCrossProvider is false",
+		});
+		expect(registry.find).not.toHaveBeenCalled();
+		expect(registry.getApiKeyAndHeaders).not.toHaveBeenCalled();
+	});
+
 	it("returns model resolution failures", async () => {
 		const runtime = new Runtime();
 		await expect(runtime.resolveModel({ model: undefined, modelRegistry: modelRegistry(), hasUI: false })).resolves.toEqual({
@@ -192,6 +257,8 @@ describe("Runtime V3 behavior", () => {
 		expect(runtime.pendingCompaction).toMatchObject({
 			boundaryKey: "root",
 			cutKey: "cut-1",
+			origin: "proactive",
+			strict: false,
 			startedAt: 100,
 			deadlineAt: 150,
 			state: "waiting_coverage",
@@ -206,6 +273,66 @@ describe("Runtime V3 behavior", () => {
 		expect(runtime.compactionDeferred).toBe(false);
 		expect(runtime.compactionDeferralCount).toBe(0);
 		expect(runtime.deferCompaction("cut-3")).toBe(1);
+	});
+
+	it("charges the recovery budget only while explicitly resumed", () => {
+		const runtime = new Runtime();
+		runtime.config = { ...runtime.config, compactionWaitForConsolidationMs: 50 };
+		runtime.deferCompaction("cut-1", "root", { now: 100, origin: "manual", strict: true });
+
+		expect(runtime.compactionRecoveryBudgetRemaining(1_000)).toBe(50);
+		expect(runtime.isCompactionRecoveryBudgetRunning()).toBe(false);
+		expect(runtime.resumeCompactionRecoveryBudget(1_000)).toBe(true);
+		expect(runtime.pendingCompaction?.deadlineAt).toBe(1_050);
+		expect(runtime.compactionRecoveryBudgetRemaining(1_020)).toBe(30);
+
+		expect(runtime.pauseCompactionRecoveryBudget(1_030)).toBe(20);
+		expect(runtime.compactionRecoveryBudgetRemaining(10_000)).toBe(20);
+		expect(runtime.isCompactionRecoveryBudgetExpired(10_000)).toBe(false);
+
+		expect(runtime.resumeCompactionRecoveryBudget(10_000)).toBe(true);
+		expect(runtime.isCompactionRecoveryBudgetExpired(10_019)).toBe(false);
+		expect(runtime.isCompactionRecoveryBudgetExpired(10_020)).toBe(true);
+	});
+
+	it("blocks and explicitly restarts strict recovery without losing its target", () => {
+		const runtime = new Runtime();
+		runtime.config = { ...runtime.config, compactionWaitForConsolidationMs: 50 };
+		runtime.deferCompaction("cut-1", "root", { now: 100, origin: "manual", strict: true });
+		runtime.blockCompactionRecovery("observer unavailable", 500);
+
+		expect(runtime.pendingCompaction).toMatchObject({
+			cutKey: "cut-1",
+			origin: "manual",
+			strict: true,
+			state: "blocked",
+			lastError: "observer unavailable",
+			retryAt: 500,
+		});
+		expect(runtime.restartCompactionRecovery(1_000)).toBe(true);
+		expect(runtime.pendingCompaction).toMatchObject({
+			cutKey: "cut-1",
+			state: "waiting_coverage",
+			startedAt: 1_000,
+			deadlineAt: 1_050,
+		});
+		expect(runtime.pendingCompaction?.lastError).toBeUndefined();
+	});
+
+	it("starts a new recovery cycle when the compaction boundary changes", () => {
+		const runtime = new Runtime();
+		runtime.config = { ...runtime.config, compactionWaitForConsolidationMs: 50 };
+		runtime.deferCompaction("cut-1", "root", { now: 100, origin: "manual", strict: true });
+		runtime.deferCompaction("cut-2", "cmp-1", { now: 200, origin: "overflow", strict: true });
+
+		expect(runtime.compactionDeferralCount).toBe(1);
+		expect(runtime.pendingCompaction).toMatchObject({
+			boundaryKey: "cmp-1",
+			cutKey: "cut-2",
+			origin: "overflow",
+			startedAt: 200,
+			deadlineAt: 250,
+		});
 	});
 
 	it("uses attempt ids so stale callbacks cannot clear a newer compaction", () => {

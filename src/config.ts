@@ -103,6 +103,11 @@ export interface Config {
 	consolidationCircuitBreakerFailures: number;
 	consolidationCircuitBreakerMs: number;
 	compactionWaitForConsolidationMs: number;
+	/**
+	 * Whether incomplete observational coverage may fall through to Pi's native
+	 * compaction, which uses the active session model.
+	 */
+	allowNativeCompactionFallback: boolean;
 	model?: ConfiguredModel;
 	allowCrossProvider: boolean;
 	showWorkerNotifications: boolean;
@@ -134,6 +139,7 @@ export const DEFAULTS: Config = {
 	consolidationCircuitBreakerFailures: 3,
 	consolidationCircuitBreakerMs: 15 * 60_000,
 	compactionWaitForConsolidationMs: 15_000,
+	allowNativeCompactionFallback: true,
 	allowCrossProvider: false,
 	showWorkerNotifications: true,
 	passive: false,
@@ -297,6 +303,9 @@ function normalizeSettingsConfig(value: Record<string, unknown>): Partial<Config
 	if (observerCoverageVerifyModel) normalized.observerCoverageVerifyModel = observerCoverageVerifyModel;
 	if (typeof value.showWorkerNotifications === "boolean") normalized.showWorkerNotifications = value.showWorkerNotifications;
 	if (typeof value.passive === "boolean") normalized.passive = value.passive;
+	if (typeof value.allowNativeCompactionFallback === "boolean") {
+		normalized.allowNativeCompactionFallback = value.allowNativeCompactionFallback;
+	}
 	if (typeof value.allowCrossProvider === "boolean") normalized.allowCrossProvider = value.allowCrossProvider;
 	if (typeof value.debugLog === "boolean") normalized.debugLog = value.debugLog;
 	const model = normalizeModel(value.model);

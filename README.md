@@ -125,9 +125,12 @@ That gives you two big benefits:
 Background work is lifecycle-bound and single-stage: observer, reflector, and dropper each
 commit their own ledger checkpoint, use independent deadlines, and retry the same watermark
 with backoff. User activity, tree changes, and shutdown abort stale work before it can append.
-Compaction never waits for the whole pipeline. It defers once only when the observer has not
-covered source history selected for removal; persistent observer failure falls back to Pi's
-native compaction instead of trapping the session.
+Compaction never waits for the whole pipeline. Its proactive trigger can start a
+boundary-scoped observer recovery when coverage is incomplete. With
+`allowNativeCompactionFallback: false`, proactive, manual, threshold, and overflow gaps all
+enter strict recovery, which never falls back to the session model; effective observer
+execution-budget exhaustion or an observer
+circuit failure leaves raw history intact in a blocked state until `/om:recover`.
 When pi-convergence is judging or scheduling a continuation, proactive compaction defers
 until that control work has finished.
 
@@ -365,10 +368,11 @@ on the `Next compaction` line regardless of mode.
 | `observerTimeoutMs`         | `180000`      | Observer stage deadline, including model resolution and background-provider queue wait.            |
 | `reflectorTimeoutMs`        | `240000`      | Reflector stage deadline.                                                                           |
 | `dropperTimeoutMs`          | `120000`      | Dropper stage deadline.                                                                             |
-| `consolidationIdleDelayMs`  | `500`         | Idle delay after `agent_end` before launching a background stage.                                   |
+| `consolidationIdleDelayMs`  | `500`         | Idle delay after `agent_settled` before launching a background stage.                               |
 | `consolidationCircuitBreakerFailures` | `3` | Consecutive failures at one watermark before opening the circuit.                                  |
 | `consolidationCircuitBreakerMs` | `900000` | Circuit-open duration after repeated failures.                                                      |
-| `compactionWaitForConsolidationMs` | `15000` | Fixed grace period for observer coverage recovery after an OM-owned proactive compaction is deferred. |
+| `compactionWaitForConsolidationMs` | `15000` | Effective observer execution-time budget for coverage recovery; foreground, scheduling, and retry waits are paused. |
+| `allowNativeCompactionFallback` | `true` | Allows incomplete coverage to fall through to Pi native compaction; set `false` for strict model isolation. |
 | `model`                     | session model | Optional memory-worker model override: `{ provider, id, thinking }`.                              |
 | `showWorkerNotifications`   | `true`        | Shows routine observer, reflector, and dropper progress notifications. Warnings and errors are unaffected. |
 | `passive`                   | `false`       | Disables proactive background observation, reflection, maintenance, and auto-compaction triggers. |
@@ -403,6 +407,7 @@ For details and tuning guidance, see [`docs/configuration.md`](docs/configuratio
 | Surface             | What it does                                                                                                                                    |
 | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | `/om:status`        | Shows memory counts, plain `+N` / `-N` visible/full drift suffixes, progress clocks, visible and active observation pool pressure, passive/in-flight state, and last worker errors. |
+| `/om:recover`       | Explicitly restarts or wakes an existing pending compaction recovery without changing fallback policy.                                  |
 | `/om:view`          | Shows current visible memory and attempts to copy the rendered memory text to the clipboard.                                                   |
 | `/om:view full`     | Shows the full current memory state for the branch and attempts to copy the rendered memory text to the clipboard.                             |
 | `recall` agent tool | Recovers source evidence for a 12-character observation/reflection id on the current branch. It is not semantic search or a transcript browser. |
@@ -417,7 +422,7 @@ For details and tuning guidance, see [`docs/configuration.md`](docs/configuratio
 flowchart TD
     AgentStart[agent_start]
     Foreground[Abort background provider lease]
-    AgentEnd[agent_end plus idle delay]
+    AgentSettled[agent_settled plus idle delay]
     Due{highest-priority stage due?}
     Observe[Capture observations]
     Reflect[Distill reflections]
@@ -427,11 +432,11 @@ flowchart TD
     Summary[visible memory for Pi]
 
     AgentStart --> Foreground
-    AgentEnd --> Due
+    AgentSettled --> Due
     Due -->|observer| Observe
     Due -->|reflector| Reflect
     Due -->|dropper| Drop
-    AgentEnd -->|compactAfterTokens and idle| Trigger --> Compact --> Summary
+    AgentSettled -->|compactAfterTokens and idle| Trigger --> Compact --> Summary
 ```
 
 The high-level lifecycle:
@@ -453,7 +458,8 @@ Current behavior:
 * **Observation-centered memory.** The extension records useful session observations while you work.
 * **Durable reflections.** The extension distills stable facts that help the agent stay oriented over time.
 * **Fast compaction.** `session_before_compact` does not call a model or wait for background workers. It renders the current prepared memory state.
-* **Background memory work.** After a successful `agent_end`, one due observer, reflector, or dropper stage acquires the shared background provider lease. Foreground work preempts it; each durable checkpoint unlocks the next stage without a monolithic pipeline.
+* **Background memory work.** After `agent_settled`, one due observer, reflector, or dropper stage acquires the shared background provider lease. Foreground work preempts it; each durable checkpoint unlocks the next stage without a monolithic pipeline.
+* **Convergence-safe checkpoints.** When `pi-convergence` is present, due observation or strict recovery requests a bounded coordination lease for an immutable branch prefix. Convergence holds new control messages while OM catches up; routine work releases after coverage, while strict recovery releases only after `session_compact` commits. Generation, boundary, target, and lease identifiers reject stale callbacks, and user activity always preempts the lease without losing raw history.
 * **Source-backed recall.** Observations and reflections can be traced back through the `recall` tool.
 * **Visible/full views.** `/om:view` shows visible memory and `/om:view full` shows the full current memory state. Use `/om:status` for visible-vs-full drift and for the separate visible observation pool vs active observation pool.
 * **No V2 compatibility layer.** Old V2 settings and memory entries are ignored rather than migrated.

@@ -59,6 +59,7 @@ describe("V3 config", () => {
 			consolidationCircuitBreakerFailures: 3,
 			consolidationCircuitBreakerMs: 900000,
 			compactionWaitForConsolidationMs: 15000,
+			allowNativeCompactionFallback: true,
 			allowCrossProvider: false,
 			showWorkerNotifications: true,
 			passive: false,
@@ -133,6 +134,20 @@ describe("V3 config", () => {
 			showWorkerNotifications: false,
 			passive: true,
 			debugLog: true,
+		});
+	});
+
+	it("loads the strict native-compaction fallback policy", () => {
+		writeJson(join(agentDir, "settings.json"), {
+			"observational-memory": {
+				allowNativeCompactionFallback: false,
+				compactionWaitForConsolidationMs: 210000,
+			},
+		});
+
+		expect(loadConfig(cwd, {})).toMatchObject({
+			allowNativeCompactionFallback: false,
+			compactionWaitForConsolidationMs: 210000,
 		});
 	});
 

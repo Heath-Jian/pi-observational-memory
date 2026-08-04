@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { registerRecoverCommand } from "./commands/recover.js";
 import { registerStatusCommand } from "./commands/status.js";
 import { registerViewCommand } from "./commands/view.js";
 import { registerCompactionHook } from "./hooks/compaction-hook.js";
@@ -14,6 +15,7 @@ export default function observationalMemory(pi: ExtensionAPI) {
 	registerCompactionTrigger(pi, runtime);
 	registerCompactionHook(pi, runtime);
 
+	registerRecoverCommand(pi, runtime);
 	registerStatusCommand(pi, runtime);
 	registerViewCommand(pi, runtime);
 	registerRecallTool(pi);

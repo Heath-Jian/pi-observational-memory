@@ -72,10 +72,11 @@ You can omit everything. Defaults work for ordinary sessions, and if `model` is 
 | `observerTimeoutMs` | positive integer | `180000` | Observer stage deadline, including model resolution and provider queue wait. |
 | `reflectorTimeoutMs` | positive integer | `240000` | Reflector stage deadline. |
 | `dropperTimeoutMs` | positive integer | `120000` | Dropper stage deadline. |
-| `consolidationIdleDelayMs` | positive integer | `500` | Delay after a successful `agent_end` before starting background work. |
+| `consolidationIdleDelayMs` | positive integer | `500` | Delay after `agent_settled` before starting background work. |
 | `consolidationCircuitBreakerFailures` | positive integer | `3` | Same-watermark failures before the stage circuit opens. |
 | `consolidationCircuitBreakerMs` | positive integer | `900000` | Circuit-open duration. |
-| `compactionWaitForConsolidationMs` | positive integer | `15000` | Fixed grace period for observer coverage recovery after an OM-owned proactive compaction is deferred. |
+| `compactionWaitForConsolidationMs` | positive integer | `15000` | Effective observer execution-time budget for coverage recovery after an incomplete compaction request. |
+| `allowNativeCompactionFallback` | boolean | `true` | When `false`, cancels compaction instead of falling through to Pi native compaction when coverage is incomplete or the OM hook is busy. |
 | `model` | object | unset | Optional model override for observer, reflector, and dropper. |
 | `model.provider` | string | unset | Provider name in Pi's model registry. Required when `model` is set. |
 | `model.id` | string | unset | Model id in Pi's model registry. Required when `model` is set. |
@@ -88,21 +89,37 @@ Valid `model.thinking` values are `off`, `minimal`, `low`, `medium`, `high`, and
 
 Invalid values are ignored. Positive-integer settings must be finite integers greater than zero. `observationsPoolTargetTokens` must also be below `observationsPoolMaxTokens`; if omitted or invalid, it is derived as `Math.floor(observationsPoolMaxTokens / 2)`.
 
-`compactionWaitForConsolidationMs` starts when an OM-owned proactive compaction
-is deferred for missing observer coverage. Ordinary proactive retries are
-coalesced during that fixed window; new messages do not extend it. Observer
-success retries immediately when Pi is idle. When the grace period expires, the
-next idle retry fails open to Pi native compaction if coverage is still missing.
-Native threshold/overflow compaction, passive mode, and explicit user compaction
-are never held behind this grace period.
+For the extension's proactive trigger, `compactionWaitForConsolidationMs` creates
+an effective-time budget when coverage is incomplete. Only observer execution
+while holding the background lease consumes this budget. Foreground activity,
+idle/pending-message waits, background lease waits, and observer retry backoff do
+not consume it. Model resolution and provider execution after the lease is
+granted do consume it. With native fallback enabled, manual, threshold,
+and overflow compactions still fail open immediately. With native fallback
+disabled, proactive, manual, threshold, and overflow gaps all create the same
+strict boundary-scoped recovery state. Recovery ignores the ordinary observation
+threshold, advances bounded batches until the requested cut is truly covered,
+and retries compaction only after that verification. New messages do not
+replenish the remaining budget.
+
+Set `allowNativeCompactionFallback` to `false` when the active session model
+must never be used for compression. In that mode incomplete coverage or a
+concurrent OM compaction hook cancels the compaction and retains the raw
+conversation. A coverage deadline or observer circuit failure changes recovery
+to `blocked`; it does not retry native compaction and does not spin a timer.
+Strict recovery also requires an explicitly configured observational-memory
+model; unavailable or disallowed model configuration fails closed instead of
+falling back to the active session model.
+`/om:status` shows the target and error, and `/om:recover` explicitly restarts
+the existing target after the dedicated memory model is available again.
 
 ## `observeAfterTokens`
 
 Default: `10000`.
 
-The observer is scheduled only after a successful `agent_end` and the configured idle delay. It counts raw/source tokens after the latest `om.observations.recorded.data.coversUpToId` marker. When the count reaches `observeAfterTokens`, the observer receives source entries after that marker and may append a non-empty `om.observations.recorded` ledger entry. A deferred compaction can force an observer below the normal threshold when uncovered source entries would otherwise be removed.
+The observer is scheduled after `agent_settled` and the configured idle delay. This event occurs only after Pi has exhausted automatic retry, automatic compaction/retry, and queued continuations. It counts raw/source tokens after the latest `om.observations.recorded.data.coversUpToId` marker. When the count reaches `observeAfterTokens`, the observer receives source entries after that marker and may append a non-empty `om.observations.recorded` ledger entry. A pending compaction recovery forces observer batches below the normal threshold until its cut is covered.
 
-Lower values create smaller chunks and more frequent model calls. Higher values reduce model-call frequency but let unobserved raw conversation accumulate longer. If the observer emits no observations, no ledger entry is written and the same range remains eligible for a later observer run.
+Lower values create smaller chunks and more frequent model calls. Higher values reduce model-call frequency but let unobserved raw conversation accumulate longer. If the observer emits no observations, no ledger entry is normally written and the same range remains eligible for a later observer run. With empty-coverage commit enabled, the dedicated verifier may approve a covered-empty marker instead.
 
 ## `reflectAfterTokens`
 
@@ -118,7 +135,7 @@ Lower values distill reflections more often and therefore create more opportunit
 
 Default: `81000`.
 
-The auto-compaction trigger runs from Pi's `agent_end` hook. It counts raw/source tokens after the latest compaction boundary. If the count reaches `compactAfterTokens`, the extension defers with `setTimeout(0)`, checks that Pi is idle, re-checks the threshold, and calls `ctx.compact()`.
+The auto-compaction trigger records the final low-level result at `agent_end` and runs from `agent_settled`. It counts raw/source tokens after the latest compaction boundary. If the count reaches `compactAfterTokens`, the extension defers with `setTimeout(0)`, checks that Pi is idle, re-checks the threshold, and calls `ctx.compact()`. A verified pending recovery bypasses this automatic threshold.
 
 This trigger does not wait for observer, reflector, or dropper work. Actual compaction summary creation happens later in `session_before_compact`, where V3 compaction is deterministic and model-free.
 

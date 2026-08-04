@@ -5,12 +5,13 @@ import { Runtime } from "../src/runtime.js";
 import { compactionEntry, textCustomMessage, type TestEntry } from "./fixtures/session.js";
 
 function captureHandler(args: { compactAfterTokens?: number; compactAfterTokensMode?: "calibrated" | "ratio"; compactAfterTokensRatio?: number; passive?: boolean; compactInFlight?: boolean } = {}) {
-	let handler: ((event: unknown, ctx: unknown) => void) | undefined;
+	let agentEndHandler: ((event: unknown, ctx: unknown) => void) | undefined;
+	let agentSettledHandler: ((event: unknown, ctx: unknown) => void) | undefined;
 	let convergenceHandler: ((event: unknown) => void) | undefined;
 	const pi = {
-		on: vi.fn((name: string, cb: typeof handler) => {
-			expect(name).toBe("agent_end");
-			handler = cb;
+		on: vi.fn((name: string, cb: typeof agentEndHandler) => {
+			if (name === "agent_end") agentEndHandler = cb;
+			if (name === "agent_settled") agentSettledHandler = cb;
 		}),
 		events: {
 			on: vi.fn((name: string, cb: typeof convergenceHandler) => {
@@ -31,9 +32,18 @@ function captureHandler(args: { compactAfterTokens?: number; compactAfterTokensM
 	runtime.compactInFlight = args.compactInFlight ?? false;
 	vi.spyOn(runtime, "invalidateConsolidation");
 	registerCompactionTrigger(pi as any, runtime as any);
-	if (!handler) throw new Error("agent_end handler was not registered");
+	if (!agentEndHandler || !agentSettledHandler) throw new Error("agent lifecycle handlers were not registered");
 	return {
-		handler,
+		fireAgentEndOnly(event: unknown, ctx: unknown) {
+			agentEndHandler?.(event, ctx);
+		},
+		fireAgentSettled(ctx: unknown) {
+			agentSettledHandler?.({ type: "agent_settled" }, ctx);
+		},
+		handler(event: unknown, ctx: unknown) {
+			agentEndHandler?.(event, ctx);
+			agentSettledHandler?.({ type: "agent_settled" }, ctx);
+		},
 		runtime,
 		convergenceState(phase: string) {
 			convergenceHandler?.({ phase });
@@ -200,15 +210,73 @@ describe("V3 compaction trigger", () => {
 		expect(forceCtx.compact).toHaveBeenCalledTimes(1);
 	});
 
-	it("skips retryable assistant errors", async () => {
-		const { handler, runtime } = captureHandler();
+	it("retries a covered manual recovery below the automatic compaction threshold", async () => {
+		const { runtime } = captureHandler({ compactAfterTokens: 100 });
+		runtime.deferCompaction("raw-1", "root", { origin: "manual", strict: true });
+		runtime.markCompactionReady();
+		const ctx = fakeCtx([belowBranch]);
+
+		requestCompaction(runtime, ctx as any, { force: true });
+		await vi.runAllTimersAsync();
+
+		expect(ctx.compact).toHaveBeenCalledTimes(1);
+		expect(runtime.pendingCompaction?.state).toBe("ready");
+	});
+
+	it("rechecks the checkpoint lease gate in the deferred compact timer", async () => {
+		const { runtime } = captureHandler({ compactAfterTokens: 100 });
+		runtime.deferCompaction("raw-1", "root", { origin: "manual", strict: true });
+		runtime.markCompactionReady();
+		const ctx = fakeCtx([belowBranch]);
+		let leaseValid = true;
+
+		requestCompaction(runtime, ctx as any, { force: true, canRun: () => leaseValid });
+		expect(runtime.compactInFlight).toBe(true);
+		leaseValid = false;
+		await vi.runAllTimersAsync();
+
+		expect(ctx.compact).not.toHaveBeenCalled();
+		expect(runtime.compactInFlight).toBe(false);
+		expect(runtime.pendingCompaction?.state).toBe("ready");
+	});
+
+	it("never force-retries a blocked strict recovery", async () => {
+		const { runtime } = captureHandler({ compactAfterTokens: 1 });
+		runtime.deferCompaction("raw-1", "root", { origin: "manual", strict: true });
+		runtime.blockCompactionRecovery("observer unavailable");
 		const ctx = fakeCtx([dueBranch]);
 
-		handler(agentEnd("fetch failed: connection lost"), ctx);
+		requestCompaction(runtime, ctx as any, { force: true });
+		await vi.runAllTimersAsync();
+
+		expect(ctx.compact).not.toHaveBeenCalled();
+		expect(runtime.pendingCompaction?.state).toBe("blocked");
+	});
+
+	it("waits for agent_settled, then evaluates compaction after a final retryable error", async () => {
+		const { fireAgentEndOnly, fireAgentSettled, runtime } = captureHandler();
+		const ctx = fakeCtx([dueBranch]);
+
+		fireAgentEndOnly(agentEnd("fetch failed: connection lost"), ctx);
 		await vi.runAllTimersAsync();
 
 		expect(runtime.compactInFlight).toBe(false);
 		expect(ctx.sessionManager.getBranch).not.toHaveBeenCalled();
+
+		fireAgentSettled(ctx);
+		await vi.runAllTimersAsync();
+		expect(ctx.compact).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not carry an agent_end compaction latch across lifecycle invalidation", async () => {
+		const { fireAgentEndOnly, fireAgentSettled, runtime } = captureHandler();
+		const ctx = fakeCtx([dueBranch]);
+
+		fireAgentEndOnly(agentEnd(), ctx);
+		runtime.invalidateConsolidation();
+		fireAgentSettled(ctx);
+		await vi.runAllTimersAsync();
+
 		expect(ctx.compact).not.toHaveBeenCalled();
 	});
 

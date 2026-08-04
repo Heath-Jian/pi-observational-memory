@@ -130,14 +130,32 @@ export function registerStatusCommand(pi: ExtensionAPI, runtime: Runtime): void 
 			const failureStates = (["observer", "reflector", "dropper"] as const)
 				.map((phase) => [phase, runtime.stageFailureStatus(phase)] as const)
 				.filter((entry) => entry[1] !== undefined);
-			if (failureStates.length > 0 || runtime.compactionDeferred) {
+			if (failureStates.length > 0 || runtime.pendingCompaction) {
 				lines.push("", "── Recovery ──");
 				for (const [phase, state] of failureStates) {
 					if (!state) continue;
 					const retryIn = Math.max(0, state.nextRetryAt - Date.now());
 					lines.push(`${phase}: ${state.failures} failure(s), retry in ~${Math.ceil(retryIn / 1000)}s${state.circuitOpenUntil ? ", circuit open" : ""}`);
 				}
-				if (runtime.compactionDeferred) lines.push(`Compaction: waiting for observer coverage (attempt ${runtime.compactionDeferralCount})`);
+					const pending = runtime.pendingCompaction;
+					if (pending) {
+						const mode = pending.strict ? "strict" : "fallback-enabled";
+						const target = `${mode}; origin ${pending.origin}, cut ${pending.cutKey}, boundary ${pending.boundaryKey}`;
+						const budgetRemaining = runtime.compactionRecoveryBudgetRemaining();
+						const budget = budgetRemaining === undefined
+							? ""
+							: `; effective recovery budget ~${Math.ceil(budgetRemaining / 1000)}s remaining (${runtime.isCompactionRecoveryBudgetRunning() ? "running" : "paused"})`;
+						const retryWindow = pending.retryAt
+							? `; observer circuit open for ~${Math.ceil(Math.max(0, pending.retryAt - Date.now()) / 1000)}s more`
+							: "";
+						if (pending.state === "blocked") {
+							lines.push(`Compaction: blocked (${target}${budget}) — ${pending.lastError ?? "recovery stopped"}${retryWindow}; run /om:recover to retry`);
+						} else if (pending.state === "ready") {
+							lines.push(`Compaction: coverage ready (${target}${budget}); waiting to retry`);
+						} else {
+							lines.push(`Compaction: waiting for observer coverage (attempt ${runtime.compactionDeferralCount}; ${target}${budget})`);
+						}
+				}
 			}
 
 			ctx.ui.notify(lines.join("\n"), "info");

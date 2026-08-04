@@ -26,6 +26,8 @@ export type StageFailureStatus = {
 
 export type CompactionAttemptKind = "proactive" | "force";
 
+export type CompactionRecoveryOrigin = "proactive" | "manual" | "threshold" | "overflow" | "unknown";
+
 export type ActiveCompactionAttempt = {
 	id: number;
 	kind: CompactionAttemptKind;
@@ -36,10 +38,17 @@ export type ActiveCompactionAttempt = {
 export type PendingCompaction = {
 	boundaryKey: string;
 	cutKey: string;
+	origin: CompactionRecoveryOrigin;
+	strict: boolean;
 	lifecycleGeneration: number;
 	startedAt: number;
+	/** Compatibility/status projection. Expiry decisions use the active-time budget APIs below. */
 	deadlineAt: number;
-	state: "waiting_coverage" | "ready";
+	recoveryBudgetRemainingMs: number;
+	recoveryBudgetActiveSince?: number;
+	state: "waiting_coverage" | "ready" | "blocked";
+	lastError?: string;
+	retryAt?: number;
 };
 
 export interface ResolveCtx {
@@ -87,6 +96,8 @@ export class Runtime {
 	lifecycleGeneration = 0;
 	lifecycleController = new AbortController();
 	convergenceControlInFlight = false;
+	/** Immutable source watermark currently protected by a coordination checkpoint. */
+	observerCheckpointTargetEntryId: string | undefined;
 	compactInFlight = false;
 	compactHookInFlight = false;
 	compactionDeferred = false;
@@ -110,10 +121,22 @@ export class Runtime {
 
 	async resolveModel(ctx: ResolveCtx, signal?: AbortSignal): Promise<ResolveResult> {
 		let model = ctx.model;
+		const strictRecovery = this.pendingCompaction?.lifecycleGeneration === this.lifecycleGeneration
+			&& this.pendingCompaction.strict
+			&& this.pendingCompaction.state === "waiting_coverage";
+		if (strictRecovery && !this.config.model) {
+			return { ok: false, reason: "strict compaction recovery requires a configured observational-memory model" };
+		}
 		if (this.config.model) {
 			const sessionProvider = (ctx.model as { provider?: unknown } | undefined)?.provider;
 			const crossProvider = typeof sessionProvider === "string" && sessionProvider !== this.config.model.provider;
 			if (crossProvider && !this.config.allowCrossProvider) {
+				if (strictRecovery) {
+					return {
+						ok: false,
+						reason: `strict compaction recovery cannot use cross-provider model ${this.config.model.provider}/${this.config.model.id} while allowCrossProvider is false`,
+					};
+				}
 				if (ctx.hasUI && ctx.ui) {
 					ctx.ui.notify(
 						`Observational memory: cross-provider model ${this.config.model.provider}/${this.config.model.id} is disabled; using session model`,
@@ -124,6 +147,11 @@ export class Runtime {
 				const configured = ctx.modelRegistry.find(this.config.model.provider, this.config.model.id);
 				if (configured) {
 					model = configured;
+				} else if (strictRecovery) {
+					return {
+						ok: false,
+						reason: `configured strict recovery model ${this.config.model.provider}/${this.config.model.id} was not found`,
+					};
 				} else if (ctx.hasUI && ctx.ui) {
 					ctx.ui.notify(
 						`Observational memory: configured model ${this.config.model.provider}/${this.config.model.id} not found, using session model`,
@@ -273,17 +301,33 @@ export class Runtime {
 		this.consolidationWatermark = undefined;
 	}
 
-	deferCompaction(key: string, boundaryKey = "root", now = Date.now()): number {
-		if (this.compactionDeferred) {
+	deferCompaction(
+		key: string,
+		boundaryKey = "root",
+		options: number | {
+			now?: number;
+			origin?: CompactionRecoveryOrigin;
+			strict?: boolean;
+		} = {},
+	): number {
+		const normalized = typeof options === "number" ? { now: options } : options;
+		const now = normalized.now ?? Date.now();
+		const canMerge = this.compactionDeferred
+			&& this.pendingCompaction?.lifecycleGeneration === this.lifecycleGeneration
+			&& this.pendingCompaction.boundaryKey === boundaryKey;
+		if (canMerge) {
 			this.compactionDeferralCount += 1;
 		} else {
 			this.compactionDeferralCount = 1;
 			this.pendingCompaction = {
 				boundaryKey,
 				cutKey: key,
+				origin: normalized.origin ?? "proactive",
+				strict: normalized.strict ?? false,
 				lifecycleGeneration: this.lifecycleGeneration,
 				startedAt: now,
 				deadlineAt: now + this.config.compactionWaitForConsolidationMs,
+				recoveryBudgetRemainingMs: this.config.compactionWaitForConsolidationMs,
 				state: "waiting_coverage",
 			};
 		}
@@ -292,16 +336,93 @@ export class Runtime {
 		if (this.pendingCompaction) {
 			this.pendingCompaction.cutKey = key;
 			this.pendingCompaction.boundaryKey = boundaryKey;
+			this.pendingCompaction.state = "waiting_coverage";
+			this.pendingCompaction.lastError = undefined;
+			this.pendingCompaction.retryAt = undefined;
+			this.pendingCompaction.strict = this.pendingCompaction.strict || normalized.strict === true;
+			if (this.pendingCompaction.origin === "unknown" && normalized.origin) {
+				this.pendingCompaction.origin = normalized.origin;
+			}
 		}
 		return this.compactionDeferralCount;
 	}
 
 	markCompactionReady(): void {
-		if (this.pendingCompaction) this.pendingCompaction.state = "ready";
+		if (this.pendingCompaction) {
+			this.pauseCompactionRecoveryBudget();
+			this.pendingCompaction.state = "ready";
+			this.pendingCompaction.lastError = undefined;
+			this.pendingCompaction.retryAt = undefined;
+		}
+	}
+
+	blockCompactionRecovery(error: string, retryAt?: number): void {
+		if (!this.pendingCompaction) return;
+		this.pauseCompactionRecoveryBudget();
+		this.pendingCompaction.state = "blocked";
+		this.pendingCompaction.lastError = error;
+		this.pendingCompaction.retryAt = retryAt;
+	}
+
+	restartCompactionRecovery(now = Date.now()): boolean {
+		const pending = this.pendingCompaction;
+		if (!pending || pending.lifecycleGeneration !== this.lifecycleGeneration) return false;
+		pending.state = "waiting_coverage";
+		pending.startedAt = now;
+		pending.deadlineAt = now + this.config.compactionWaitForConsolidationMs;
+		pending.recoveryBudgetRemainingMs = this.config.compactionWaitForConsolidationMs;
+		pending.recoveryBudgetActiveSince = undefined;
+		pending.lastError = undefined;
+		pending.retryAt = undefined;
+		this.compactionDeferred = true;
+		this.recordStageSuccess("observer");
+		return true;
+	}
+
+	compactionRecoveryBudgetRemaining(now = Date.now()): number | undefined {
+		const pending = this.pendingCompaction;
+		if (!pending) return undefined;
+		const activeElapsed = pending.recoveryBudgetActiveSince === undefined
+			? 0
+			: Math.max(0, now - pending.recoveryBudgetActiveSince);
+		return Math.max(0, pending.recoveryBudgetRemainingMs - activeElapsed);
+	}
+
+	isCompactionRecoveryBudgetRunning(): boolean {
+		return this.pendingCompaction?.recoveryBudgetActiveSince !== undefined;
+	}
+
+	resumeCompactionRecoveryBudget(now = Date.now()): boolean {
+		const pending = this.pendingCompaction;
+		if (
+			!pending
+			|| pending.lifecycleGeneration !== this.lifecycleGeneration
+			|| pending.state !== "waiting_coverage"
+			|| pending.recoveryBudgetActiveSince !== undefined
+			|| pending.recoveryBudgetRemainingMs <= 0
+		) return false;
+		pending.recoveryBudgetActiveSince = now;
+		pending.deadlineAt = now + pending.recoveryBudgetRemainingMs;
+		return true;
+	}
+
+	pauseCompactionRecoveryBudget(now = Date.now()): number | undefined {
+		const pending = this.pendingCompaction;
+		if (!pending) return undefined;
+		const remaining = this.compactionRecoveryBudgetRemaining(now) ?? 0;
+		pending.recoveryBudgetRemainingMs = remaining;
+		pending.recoveryBudgetActiveSince = undefined;
+		pending.deadlineAt = now + remaining;
+		return remaining;
+	}
+
+	isCompactionRecoveryBudgetExpired(now = Date.now()): boolean {
+		const remaining = this.compactionRecoveryBudgetRemaining(now);
+		return remaining !== undefined && remaining <= 0;
 	}
 
 	isDeferredGraceActive(now = Date.now()): boolean {
-		return !!this.pendingCompaction && now < this.pendingCompaction.deadlineAt;
+		return (this.compactionRecoveryBudgetRemaining(now) ?? 0) > 0;
 	}
 
 	beginCompactionAttempt(kind: CompactionAttemptKind, boundaryKey: string): ActiveCompactionAttempt {
@@ -357,6 +478,7 @@ export class Runtime {
 		this.lifecycleGeneration += 1;
 		this.abortConsolidation("session or branch changed");
 		this.convergenceControlInFlight = false;
+		this.observerCheckpointTargetEntryId = undefined;
 		this.clearCompactionState();
 	}
 

@@ -43,6 +43,8 @@ function setup(args: { entries: TestEntry[]; runtime?: Partial<any>; model?: unk
 		compactionDeferred: false,
 		compactionDeferralCount: 0,
 		stageFailureStatus: vi.fn(() => undefined),
+		compactionRecoveryBudgetRemaining: vi.fn(() => undefined),
+		isCompactionRecoveryBudgetRunning: vi.fn(() => false),
 		...args.runtime,
 	};
 	registerStatusCommand(pi as any, runtime as any);
@@ -204,6 +206,48 @@ describe("V3 /om:status", () => {
 
 		expect(output).toContain("Consolidation: running");
 		expect(output).not.toContain("Consolidation: running (");
+	});
+
+	it("shows the strict blocked recovery target and the recover command", async () => {
+		const output = await setup({
+			entries: [],
+			runtime: {
+				pendingCompaction: {
+					boundaryKey: "cmp-1",
+					cutKey: "raw-9",
+					origin: "manual",
+					strict: true,
+					state: "blocked",
+					lastError: "observer unavailable",
+				},
+			},
+		}).run();
+
+		expect(output).toContain("── Recovery ──");
+		expect(output).toContain("Compaction: blocked");
+		expect(output).toContain("origin manual, cut raw-9, boundary cmp-1");
+		expect(output).toContain("observer unavailable");
+		expect(output).toContain("/om:recover");
+	});
+
+	it("shows effective recovery budget state instead of a wall-clock deadline", async () => {
+		const output = await setup({
+			entries: [],
+			runtime: {
+				compactionDeferralCount: 1,
+				pendingCompaction: {
+					boundaryKey: "root",
+					cutKey: "raw-9",
+					origin: "manual",
+					strict: true,
+					state: "waiting_coverage",
+				},
+				compactionRecoveryBudgetRemaining: vi.fn(() => 12_400),
+				isCompactionRecoveryBudgetRunning: vi.fn(() => false),
+			},
+		}).run();
+
+		expect(output).toContain("effective recovery budget ~13s remaining (paused)");
 	});
 
 	describe("ratio mode", () => {

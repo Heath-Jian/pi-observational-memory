@@ -22,6 +22,7 @@ function setup(args: {
 	compactHookInFlight?: boolean;
 	consolidationPromise?: Promise<void> | null;
 	compactionWaitForConsolidationMs?: number;
+	allowNativeCompactionFallback?: boolean;
 	activeKind?: "proactive" | "force";
 	passive?: boolean;
 }) {
@@ -40,6 +41,7 @@ function setup(args: {
 		passive: args.passive ?? false,
 		observationsPoolMaxTokens: args.observationsPoolMaxTokens ?? 20_000,
 		compactionWaitForConsolidationMs: args.compactionWaitForConsolidationMs ?? 50,
+		allowNativeCompactionFallback: args.allowNativeCompactionFallback ?? true,
 	};
 	runtime.compactHookInFlight = args.compactHookInFlight ?? false;
 	runtime.consolidationPromise = args.consolidationPromise as any ?? null;
@@ -251,6 +253,49 @@ describe("V3 compaction hook", () => {
 		expect(runtime.clearCompactionDeferral).toHaveBeenCalledTimes(1);
 	});
 
+	it("cancels instead of using Pi native compaction when fallback is disabled", async () => {
+		const entries = [textCustomMessage("raw-1", "aaaa"), textCustomMessage("raw-2", "bbbb")];
+		const { run, runtime, ctx } = setup({
+			entries,
+			activeKind: "proactive",
+			allowNativeCompactionFallback: false,
+		});
+
+		await expect(run("raw-2")).resolves.toEqual({ cancel: true });
+		await expect(run("raw-2")).resolves.toEqual({ cancel: true });
+		expect(runtime.clearCompactionDeferral).not.toHaveBeenCalled();
+		expect(runtime.abortConsolidation).not.toHaveBeenCalledWith("native compaction fallback");
+		expect(ctx.ui.notify).toHaveBeenCalledWith(
+			expect.stringContaining("cancelled to avoid using the session model"),
+			"warning",
+		);
+	});
+
+	it("moves a strict forced retry back to waiting when Pi advances the cut", async () => {
+		const entries = [
+			textCustomMessage("raw-1", "aaaa"),
+			textCustomMessage("raw-2", "bbbb"),
+			textCustomMessage("raw-3", "cccc"),
+		];
+		const { run, runtime } = setup({
+			entries,
+			activeKind: "force",
+			allowNativeCompactionFallback: false,
+		});
+		runtime.deferCompaction("raw-2", "root", { origin: "manual", strict: true });
+		runtime.markCompactionReady();
+
+		await expect(run("raw-3")).resolves.toEqual({ cancel: true });
+
+		expect(runtime.pendingCompaction).toMatchObject({
+			boundaryKey: "root",
+			cutKey: "raw-3",
+			origin: "manual",
+			strict: true,
+			state: "waiting_coverage",
+		});
+	});
+
 	it("fails open when a duplicate compaction hook is already running", async () => {
 		const entries = [textCustomMessage("raw-1", "aaaa")];
 		const { run, ctx } = setup({ entries, compactHookInFlight: true });
@@ -258,6 +303,21 @@ describe("V3 compaction hook", () => {
 		await expect(run("raw-1")).resolves.toBeUndefined();
 		expect(ctx.ui.notify).toHaveBeenCalledWith(
 			"Observational memory: another compaction hook is already running; using Pi native compaction",
+			"warning",
+		);
+	});
+
+	it("cancels a duplicate compaction hook when native fallback is disabled", async () => {
+		const entries = [textCustomMessage("raw-1", "aaaa")];
+		const { run, ctx } = setup({
+			entries,
+			compactHookInFlight: true,
+			allowNativeCompactionFallback: false,
+		});
+
+		await expect(run("raw-1")).resolves.toEqual({ cancel: true });
+		expect(ctx.ui.notify).toHaveBeenCalledWith(
+			expect.stringContaining("cancelled to avoid using the session model"),
 			"warning",
 		);
 	});
@@ -272,6 +332,45 @@ describe("V3 compaction hook", () => {
 
 		await expect(run("raw-2", undefined, reason)).resolves.toBeUndefined();
 		expect(runtime.compactionDeferred).toBe(false);
+	});
+
+	it.each([
+		["overflow", undefined],
+		["threshold", undefined],
+		["manual", undefined],
+	] as const)("cancels non-OM %s compaction when native fallback is disabled", async (reason) => {
+		const entries = [textCustomMessage("raw-1", "aaaa"), textCustomMessage("raw-2", "bbbb")];
+		const { run, runtime } = setup({ entries, allowNativeCompactionFallback: false });
+
+		await expect(run("raw-2", undefined, reason)).resolves.toEqual({ cancel: true });
+		expect(runtime.compactionDeferred).toBe(true);
+		expect(runtime.pendingCompaction).toMatchObject({
+			boundaryKey: "root",
+			cutKey: "raw-2",
+			origin: reason,
+			strict: true,
+			state: "waiting_coverage",
+		});
+	});
+
+	it("does not let a new strict compaction event silently restart blocked recovery", async () => {
+		const entries = [textCustomMessage("raw-1", "aaaa"), textCustomMessage("raw-2", "bbbb")];
+		const { run, runtime, ctx, pi } = setup({ entries, allowNativeCompactionFallback: false });
+		runtime.deferCompaction("raw-2", "root", { origin: "threshold", strict: true });
+		runtime.blockCompactionRecovery("observer circuit open");
+		vi.mocked(runtime.deferCompaction).mockClear();
+		pi.events.emit.mockClear();
+
+		await expect(run("raw-2", undefined, "overflow")).resolves.toEqual({ cancel: true });
+
+		expect(runtime.deferCompaction).not.toHaveBeenCalled();
+		expect(runtime.pendingCompaction).toMatchObject({
+			state: "blocked",
+			origin: "threshold",
+			lastError: "observer circuit open",
+		});
+		expect(pi.events.emit).not.toHaveBeenCalled();
+		expect(ctx.ui.notify).toHaveBeenCalledWith(expect.stringContaining("/om:recover"), "warning");
 	});
 
 	it("does not intercept compaction in passive mode", async () => {

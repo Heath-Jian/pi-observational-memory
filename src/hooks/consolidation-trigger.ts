@@ -30,6 +30,7 @@ import {
 	isSourceEntry,
 	latestCoverageIndex,
 	latestCoverageMarkerId,
+	observationCoverageIncludesCompactionPrefix,
 	observationToSummaryLine,
 	observationTokensSinceReflectionCoverage,
 	observerBatchesSinceReflectionCoverage,
@@ -41,7 +42,21 @@ import {
 import {
 	OM_COMPACTION_CLEARED_EVENT,
 	OM_COMPACTION_DEFERRED_EVENT,
+	OM_COMPACTION_RECOVERY_REQUESTED_EVENT,
 } from "./compaction-events.js";
+import {
+	CHECKPOINT_CANCEL_EVENT,
+	CHECKPOINT_FINISH_EVENT,
+	CHECKPOINT_GRANT_EVENT,
+	CHECKPOINT_RELEASE_EVENT,
+	CHECKPOINT_REQUEST_EVENT,
+	isCheckpointGrant,
+	isCheckpointRelease,
+	type CheckpointFinishOutcome,
+	type CheckpointFinishReason,
+	type CheckpointGrantV1,
+	type CheckpointRequestV1,
+} from "./checkpoint-events.js";
 import { requestCompaction } from "./compaction-trigger.js";
 
 type ResolvedModel = Extract<ResolveResult, { ok: true }>;
@@ -73,9 +88,21 @@ type DueStage = {
 };
 
 function stagePriority(phase: ConsolidationPhase, runtime: Runtime): number {
-	if (phase === "observer") return runtime.compactionDeferred ? 350 : 200;
+	if (phase === "observer") return isCoverageRecoveryWaiting(runtime) ? 350 : 200;
 	if (phase === "reflector") return 100;
 	return 50;
+}
+
+function isCoverageRecoveryWaiting(runtime: Runtime): boolean {
+	const pending = runtime.pendingCompaction;
+	return !!pending
+		&& pending.lifecycleGeneration === runtime.lifecycleGeneration
+		&& pending.state === "waiting_coverage";
+}
+
+function isStrictRecovery(runtime: Runtime): boolean {
+	return runtime.pendingCompaction?.strict === true
+		|| runtime.config.allowNativeCompactionFallback === false;
 }
 
 function sourceEntriesAfter(entries: Entry[], index: number): Entry[] {
@@ -254,8 +281,15 @@ function appendEntry(pi: ExtensionAPI, customType: string, data: unknown): void 
 }
 
 function findDueStage(entries: Entry[], runtime: Runtime): DueStage | undefined {
+	const checkpointTarget = runtime.observerCheckpointTargetEntryId;
+	if (checkpointTarget) {
+		const targetIndex = entries.findIndex((entry) => entry.id === checkpointTarget);
+		if (targetIndex >= 0 && latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED) < targetIndex) {
+			return { phase: "observer", watermark: checkpointTarget };
+		}
+	}
 	const observationTokens = rawTokensSinceObservationCoverage(entries);
-	if (observationTokens >= runtime.config.observeAfterTokens || runtime.compactionDeferred) {
+	if (observationTokens >= runtime.config.observeAfterTokens || isCoverageRecoveryWaiting(runtime)) {
 		const lastCoverageIdx = latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED);
 		const watermark = sourceEntriesAfter(entries, lastCoverageIdx).at(-1)?.id;
 		if (watermark) return { phase: "observer", watermark };
@@ -322,6 +356,15 @@ function latestCompactionBoundaryKey(entries: Entry[]): string {
 	return "root";
 }
 
+function compactionCheckpointTarget(entries: Entry[], cutKey: string | undefined): string | undefined {
+	const cutIndex = cutKey ? entries.findIndex((entry) => entry.id === cutKey) : -1;
+	if (cutIndex <= 0) return undefined;
+	for (let index = cutIndex - 1; index >= 0; index -= 1) {
+		if (isSourceEntry(entries[index])) return entries[index].id;
+	}
+	return undefined;
+}
+
 function makeModelResolver(runtime: Runtime, ctx: ConsolidationCtx, run: ConsolidationRun) {
 	return async (stage: ConsolidationPhase): Promise<ResolvedModel | undefined> => {
 		const resolved = await runtime.resolveModel({
@@ -347,7 +390,20 @@ export function registerConsolidationTrigger(pi: ExtensionAPI, runtime: Runtime)
 	let scheduleTimer: ReturnType<typeof setTimeout> | undefined;
 	let recoveryTimer: ReturnType<typeof setTimeout> | undefined;
 	let lastCtx: ConsolidationCtx | undefined;
+	let convergenceSeen = false;
 	let configDiagnosticsNotified = false;
+	let checkpointSequence = 0;
+	const checkpointNonce = Math.random().toString(36).slice(2, 10);
+	type ActiveCheckpoint = {
+		request: CheckpointRequestV1;
+		strict: boolean;
+		ctx: ConsolidationCtx;
+		requiresGrant: boolean;
+		lease?: CheckpointGrantV1;
+		grantTimer?: ReturnType<typeof setTimeout>;
+		leaseTimer?: ReturnType<typeof setTimeout>;
+	};
+	let checkpoint: ActiveCheckpoint | undefined;
 
 	const notifyConfigDiagnostics = (ctx: ConsolidationCtx) => {
 		runtime.ensureConfig(ctx.cwd);
@@ -367,7 +423,222 @@ export function registerConsolidationTrigger(pi: ExtensionAPI, runtime: Runtime)
 		recoveryTimer = undefined;
 	};
 
+	const targetIsCovered = (entries: Entry[], targetEntryId: string): boolean => {
+		const targetIndex = entries.findIndex((entry) => entry.id === targetEntryId);
+		return targetIndex >= 0 && latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED) >= targetIndex;
+	};
+
+	const clearCheckpointTimers = (active: ActiveCheckpoint): void => {
+		if (active.grantTimer) clearTimeout(active.grantTimer);
+		if (active.leaseTimer) clearTimeout(active.leaseTimer);
+		active.grantTimer = undefined;
+		active.leaseTimer = undefined;
+	};
+
+	const checkpointLeaseIsUsable = (
+		active = checkpoint,
+		now = Date.now(),
+	): active is ActiveCheckpoint & { lease: CheckpointGrantV1 } => {
+		if (!active?.lease) return false;
+		const { request, lease } = active;
+		return request.requesterGeneration === runtime.lifecycleGeneration
+			&& lease.requestId === request.requestId
+			&& lease.requesterGeneration === request.requesterGeneration
+			&& lease.boundaryKey === request.boundaryKey
+			&& lease.targetEntryId === request.targetEntryId
+			&& lease.branchHeadId === request.branchHeadId
+			&& lease.expiresAt > now;
+	};
+
+	const checkpointMatchesRecovery = (
+		entries: Entry[],
+		pending: NonNullable<Runtime["pendingCompaction"]>,
+	): boolean => {
+		const targetEntryId = compactionCheckpointTarget(entries, pending.cutKey);
+		return !!targetEntryId
+			&& checkpoint?.strict === true
+			&& checkpoint.request.requesterGeneration === runtime.lifecycleGeneration
+			&& checkpoint.request.boundaryKey === pending.boundaryKey
+			&& checkpoint.request.targetEntryId === targetEntryId
+			&& checkpointLeaseIsUsable(checkpoint);
+	};
+
+	const finishCheckpoint = (
+		outcome: CheckpointFinishOutcome,
+		error?: string,
+		coversUpToId?: string,
+		reason?: CheckpointFinishReason,
+	): ActiveCheckpoint | undefined => {
+		const active = checkpoint;
+		if (!active) return undefined;
+		clearCheckpointTimers(active);
+		checkpoint = undefined;
+		runtime.observerCheckpointTargetEntryId = undefined;
+		if (active.lease) {
+			pi.events.emit(CHECKPOINT_FINISH_EVENT, {
+				version: 1,
+				requestId: active.request.requestId,
+				leaseId: active.lease.leaseId,
+				requesterGeneration: active.request.requesterGeneration,
+				boundaryKey: active.request.boundaryKey,
+				targetEntryId: active.request.targetEntryId,
+				branchHeadId: active.request.branchHeadId,
+				outcome,
+				...(coversUpToId ? { coversUpToId } : {}),
+				...(error ? { error } : {}),
+				...(reason ? { reason } : {}),
+				finishedAt: Date.now(),
+			});
+		}
+		return active;
+	};
+
+	const cancelPendingCheckpoint = (reason: "superseded" | "session-changed" | "grant-timeout"): ActiveCheckpoint | undefined => {
+		const active = checkpoint;
+		if (!active || active.lease) return undefined;
+		clearCheckpointTimers(active);
+		checkpoint = undefined;
+		runtime.observerCheckpointTargetEntryId = undefined;
+		pi.events.emit(CHECKPOINT_CANCEL_EVENT, {
+			version: 1,
+			requestId: active.request.requestId,
+			requesterGeneration: active.request.requesterGeneration,
+			boundaryKey: active.request.boundaryKey,
+			targetEntryId: active.request.targetEntryId,
+			branchHeadId: active.request.branchHeadId,
+			reason,
+			cancelledAt: Date.now(),
+		});
+		return active;
+	};
+
+	const checkpointLeaseMs = (strict: boolean): number => {
+		if (!strict) return Math.max(60_000, runtime.config.observerTimeoutMs + 60_000);
+		const remaining = runtime.compactionRecoveryBudgetRemaining()
+			?? runtime.config.compactionWaitForConsolidationMs;
+		return Math.max(
+			runtime.config.observerTimeoutMs + 60_000,
+			remaining + runtime.config.consolidationCircuitBreakerMs + 60_000,
+		);
+	};
+
+	const requestCheckpoint = (
+		ctx: ConsolidationCtx,
+		strict: boolean,
+		targetOverride?: string,
+	): void => {
+		if (runtime.config.passive) return;
+		const entries = ctx.sessionManager.getBranch() as Entry[];
+		const pending = runtime.pendingCompaction;
+		const due = findDueStage(entries, runtime);
+		const targetEntryId = targetOverride
+			?? (strict
+				? compactionCheckpointTarget(entries, pending?.cutKey)
+				: due?.phase === "observer" ? due.watermark : undefined);
+		if (!targetEntryId) return;
+		const boundaryKey = latestCompactionBoundaryKey(entries);
+		if (strict && (!pending || pending.boundaryKey !== boundaryKey)) return;
+
+		if (checkpoint) {
+			checkpoint.ctx = ctx;
+			if (!strict) return;
+			if (checkpoint.strict && checkpoint.request.targetEntryId === targetEntryId) {
+				if (!convergenceSeen || checkpointLeaseIsUsable(checkpoint)) return;
+				if (checkpoint.requiresGrant && !checkpoint.lease) return;
+				if (checkpoint.lease) {
+					if (runtime.consolidationInFlight) runtime.abortConsolidation("checkpoint lease no longer usable");
+					finishCheckpoint("failed", "checkpoint lease expired before recovery completed", undefined, "lease-expired");
+				} else {
+					cancelPendingCheckpoint("superseded");
+				}
+				setTimeout(() => requestCheckpoint(ctx, true, targetEntryId), 0);
+				return;
+			}
+			if (checkpoint.lease) {
+				if (runtime.consolidationInFlight) runtime.abortConsolidation("checkpoint target superseded");
+				finishCheckpoint("aborted", "routine checkpoint upgraded to a newer strict compaction target", undefined, "superseded");
+			} else {
+				cancelPendingCheckpoint("superseded");
+			}
+			setTimeout(() => requestCheckpoint(ctx, true, targetEntryId), 0);
+			return;
+		}
+
+		const request: CheckpointRequestV1 = {
+			version: 1,
+			requestId: `om:${checkpointNonce}:${++checkpointSequence}`,
+			requester: "observational-memory",
+			requesterGeneration: runtime.lifecycleGeneration,
+			purpose: strict
+				? "observational-memory:compaction-recovery"
+				: "observational-memory:observe",
+			urgency: strict ? "strict" : "routine",
+			boundaryKey,
+			targetEntryId,
+			branchHeadId: entries.at(-1)?.id ?? targetEntryId,
+			requestedAt: Date.now(),
+			maxLeaseMs: checkpointLeaseMs(strict),
+		};
+		checkpoint = { request, strict, ctx, requiresGrant: false };
+		runtime.observerCheckpointTargetEntryId = targetEntryId;
+		pi.events.emit(CHECKPOINT_REQUEST_EVENT, request);
+		if (checkpoint?.request === request) {
+			checkpoint.requiresGrant = convergenceSeen;
+			if (checkpoint.requiresGrant && !checkpoint.lease) {
+				const active = checkpoint;
+				active.grantTimer = setTimeout(() => {
+					if (checkpoint !== active || active.lease) return;
+					const strictRequest = active.strict;
+					const fallbackCtx = active.ctx;
+					cancelPendingCheckpoint("grant-timeout");
+					if (strictRequest && runtime.pendingCompaction?.state !== "blocked") {
+						scheduleRecovery(fallbackCtx, 0);
+					} else {
+						schedule(fallbackCtx, 0);
+					}
+				}, Math.min(60_000, request.maxLeaseMs));
+			}
+		}
+	};
+
+	const onObserverProgress = (entries: Entry[]): boolean => {
+		const active = checkpoint;
+		if (!active || active.strict || !targetIsCovered(entries, active.request.targetEntryId)) return false;
+		finishCheckpoint("observed", undefined, active.request.targetEntryId);
+		return true;
+	};
+
+	const onObserverFailure = (error?: string): boolean => {
+		if (!checkpoint || checkpoint.strict) return false;
+		finishCheckpoint("failed", error ?? "routine observer checkpoint failed");
+		return true;
+	};
+
 	let scheduleRecovery!: (ctx: ConsolidationCtx, delayMs?: number) => void;
+	const blockRecovery = (
+		ctx: ConsolidationCtx,
+		reason: string,
+		retryAt?: number,
+	) => {
+		const pending = runtime.pendingCompaction;
+		if (!pending || pending.state === "blocked") return;
+		runtime.blockCompactionRecovery(reason, retryAt);
+		clearSchedule();
+		clearRecovery();
+		if (runtime.consolidationInFlight) runtime.abortConsolidation(reason);
+		if (checkpoint?.strict) finishCheckpoint("failed", reason);
+		debugLog("compaction.recovery_blocked", {
+			reason,
+			retryAt,
+			cutKey: pending.cutKey,
+			boundaryKey: pending.boundaryKey,
+			origin: pending.origin,
+		});
+		if (ctx.hasUI) ctx.ui?.notify(
+			`Observational memory: compaction recovery blocked — ${reason}`,
+			"warning",
+		);
+	};
 
 	const schedule = (ctx: ConsolidationCtx, delayMs = runtime.config.consolidationIdleDelayMs) => {
 		clearSchedule();
@@ -375,7 +646,23 @@ export function registerConsolidationTrigger(pi: ExtensionAPI, runtime: Runtime)
 		scheduleTimer = setTimeout(() => {
 			scheduleTimer = undefined;
 			if (!runtime.isLifecycleCurrent(lifecycleGeneration)) return;
-			maybeLaunchStage(pi, runtime, ctx, schedule, scheduleRecovery);
+			const due = findDueStage(ctx.sessionManager.getBranch() as Entry[], runtime);
+			if (convergenceSeen && due?.phase === "observer" && !checkpointLeaseIsUsable()) {
+				requestCheckpoint(ctx, isCoverageRecoveryWaiting(runtime));
+				return;
+			}
+			maybeLaunchStage(
+				pi,
+				runtime,
+				ctx,
+				schedule,
+				scheduleRecovery,
+				blockRecovery,
+				onObserverProgress,
+				onObserverFailure,
+				() => !convergenceSeen || checkpointLeaseIsUsable(),
+				() => !convergenceSeen || checkpointLeaseIsUsable(),
+			);
 		}, Math.max(0, delayMs));
 	};
 
@@ -388,41 +675,86 @@ export function registerConsolidationTrigger(pi: ExtensionAPI, runtime: Runtime)
 
 			const pending = runtime.pendingCompaction;
 			if (!pending || pending.lifecycleGeneration !== lifecycleGeneration) return;
+			if (pending.state === "blocked") return;
 
 			const entries = ctx.sessionManager.getBranch() as Entry[];
 			if (latestCompactionBoundaryKey(entries) !== pending.boundaryKey) {
 				runtime.clearCompactionDeferral();
 				return;
 			}
-
-			if (
-				runtime.convergenceControlInFlight
+			const schedulingBlocked = runtime.convergenceControlInFlight
 				|| runtime.compactInFlight
 				|| runtime.compactHookInFlight
-				|| !isContextIdle(ctx)
-			) {
+				|| !isContextIdle(ctx);
+			if (convergenceSeen && !checkpointMatchesRecovery(entries, pending)) {
+				runtime.pauseCompactionRecoveryBudget();
+				if (!schedulingBlocked) requestCheckpoint(ctx, true);
+				if (checkpoint?.requiresGrant && !checkpointLeaseIsUsable()) return;
 				scheduleRecovery(ctx);
 				return;
 			}
 
-			const deadlineReached = Date.now() >= pending.deadlineAt;
-			if (pending.state === "ready" || deadlineReached) {
-				runtime.markCompactionReady();
-				if (runtime.consolidationInFlight) {
-					runtime.abortConsolidation(deadlineReached
-						? "compaction coverage grace expired"
-						: "observer coverage ready");
+			if (pending.state === "ready") {
+				if (schedulingBlocked) {
+					scheduleRecovery(ctx);
+					return;
 				}
-				requestCompaction(runtime, ctx as any, { force: true });
+				if (runtime.consolidationInFlight) runtime.abortConsolidation("observer coverage ready");
+				requestCompaction(runtime, ctx as any, {
+					force: true,
+					canRun: () => {
+						if (!convergenceSeen) return true;
+						const current = runtime.pendingCompaction;
+						return !!current
+							&& checkpointMatchesRecovery(ctx.sessionManager.getBranch() as Entry[], current);
+					},
+				});
 				if (runtime.pendingCompaction) scheduleRecovery(ctx);
 				return;
 			}
 
+			const recoveryBudgetExhausted = runtime.isCompactionRecoveryBudgetExpired();
+			if (recoveryBudgetExhausted) {
+				if (isStrictRecovery(runtime)) {
+					blockRecovery(ctx, "effective observer recovery budget was exhausted before the compaction cut was covered");
+					return;
+				}
+				runtime.markCompactionReady();
+				if (runtime.consolidationInFlight) runtime.abortConsolidation("compaction coverage grace expired");
+				requestCompaction(runtime, ctx as any, {
+					force: true,
+					canRun: () => {
+						if (!convergenceSeen) return true;
+						const current = runtime.pendingCompaction;
+						return !!current
+							&& checkpointMatchesRecovery(ctx.sessionManager.getBranch() as Entry[], current);
+					},
+				});
+				if (runtime.pendingCompaction) scheduleRecovery(ctx);
+				return;
+			}
+
+			if (schedulingBlocked) {
+				scheduleRecovery(ctx);
+				return;
+			}
+
 			if (!runtime.consolidationInFlight) {
-				maybeLaunchStage(pi, runtime, ctx, schedule, scheduleRecovery);
+				maybeLaunchStage(
+					pi,
+					runtime,
+					ctx,
+					schedule,
+					scheduleRecovery,
+					blockRecovery,
+					onObserverProgress,
+					onObserverFailure,
+					() => !convergenceSeen || checkpointLeaseIsUsable(),
+					() => !convergenceSeen || checkpointLeaseIsUsable(),
+				);
 			}
 			if (runtime.pendingCompaction) {
-				const remaining = Math.max(0, pending.deadlineAt - Date.now());
+				const remaining = runtime.compactionRecoveryBudgetRemaining() ?? 0;
 				scheduleRecovery(ctx, Math.min(runtime.config.consolidationIdleDelayMs, remaining));
 			}
 		}, Math.max(0, delayMs));
@@ -432,39 +764,141 @@ export function registerConsolidationTrigger(pi: ExtensionAPI, runtime: Runtime)
 		const ctx = rawCtx as ConsolidationCtx | undefined;
 		if (ctx) notifyConfigDiagnostics(ctx);
 		getBackgroundBroker().setForegroundActive(true);
+		runtime.pauseCompactionRecoveryBudget();
 		clearSchedule();
 		if (runtime.consolidationInFlight) runtime.abortConsolidation("foreground activity");
 	});
-	pi.on("agent_end", (event: any, rawCtx: any) => {
+	pi.on("agent_end", (_event: any, rawCtx: any) => {
 		const ctx = rawCtx as ConsolidationCtx;
 		lastCtx = ctx;
 		notifyConfigDiagnostics(ctx);
-		const lastAssistant = [...event.messages].reverse().find((message: any) => message?.role === "assistant");
-		if (lastAssistant?.stopReason === "aborted" || lastAssistant?.stopReason === "error") {
-			clearSchedule();
-			if (runtime.consolidationInFlight) runtime.abortConsolidation("foreground run ended unsuccessfully");
-			return;
+		if (convergenceSeen && !checkpoint) {
+			const pending = runtime.pendingCompaction;
+			if (pending && pending.state !== "blocked") requestCheckpoint(ctx, true);
+			else if (findDueStage(ctx.sessionManager.getBranch() as Entry[], runtime)?.phase === "observer") {
+				requestCheckpoint(ctx, false);
+			}
 		}
+	});
+	pi.on("agent_settled", (_event: any, rawCtx: any) => {
+		const ctx = (rawCtx as ConsolidationCtx | undefined) ?? lastCtx;
 		getBackgroundBroker().setForegroundActive(false);
+		if (!ctx) return;
+		lastCtx = ctx;
+		notifyConfigDiagnostics(ctx);
+		if (runtime.pendingCompaction?.state === "blocked") return;
+		if (convergenceSeen && !checkpoint) {
+			const pending = runtime.pendingCompaction;
+			if (pending && pending.state !== "blocked") requestCheckpoint(ctx, true);
+			else if (findDueStage(ctx.sessionManager.getBranch() as Entry[], runtime)?.phase === "observer") {
+				requestCheckpoint(ctx, false);
+			}
+		}
 		schedule(ctx);
 		if (runtime.pendingCompaction) scheduleRecovery(ctx);
 	});
 
-	pi.events.on(OM_COMPACTION_DEFERRED_EVENT, () => {
-		if (lastCtx && runtime.pendingCompaction) scheduleRecovery(lastCtx, 0);
+	const handleRecoveryRequest = (event: any) => {
+		const ctx = (event?.ctx as ConsolidationCtx | undefined) ?? lastCtx;
+		if (!ctx || !runtime.pendingCompaction || runtime.pendingCompaction.state === "blocked") return;
+		lastCtx = ctx;
+		requestCheckpoint(ctx, true);
+		scheduleRecovery(ctx, 0);
+	};
+	pi.events.on(OM_COMPACTION_DEFERRED_EVENT, handleRecoveryRequest);
+	pi.events.on(OM_COMPACTION_RECOVERY_REQUESTED_EVENT, handleRecoveryRequest);
+	pi.events.on(OM_COMPACTION_CLEARED_EVENT, (event: any) => {
+		clearRecovery();
+		if (!checkpoint) return;
+		finishCheckpoint(event?.reason === "session_compact" ? "compacted" : "not-needed", event?.reason);
 	});
-	pi.events.on(OM_COMPACTION_CLEARED_EVENT, () => clearRecovery());
+	pi.events.on(CHECKPOINT_GRANT_EVENT, (event: unknown) => {
+		if (!checkpoint || !isCheckpointGrant(event)) return;
+		const request = checkpoint.request;
+		if (
+			event.requestId !== request.requestId
+			|| event.requesterGeneration !== runtime.lifecycleGeneration
+			|| event.requesterGeneration !== request.requesterGeneration
+			|| event.boundaryKey !== request.boundaryKey
+			|| event.targetEntryId !== request.targetEntryId
+			|| event.branchHeadId !== request.branchHeadId
+		) return;
+		const entries = checkpoint.ctx.sessionManager.getBranch() as Entry[];
+		const targetIndex = entries.findIndex((entry) => entry.id === request.targetEntryId);
+		if (latestCompactionBoundaryKey(entries) !== request.boundaryKey || targetIndex < 0) {
+			checkpoint.lease = event;
+			finishCheckpoint("aborted", "checkpoint target is stale for the current branch");
+			return;
+		}
+		checkpoint.lease = event;
+		if (checkpoint.grantTimer) {
+			clearTimeout(checkpoint.grantTimer);
+			checkpoint.grantTimer = undefined;
+		}
+		const active = checkpoint;
+		active.leaseTimer = setTimeout(() => {
+			if (checkpoint !== active || checkpoint.lease !== event) return;
+			const ctx = active.ctx;
+			const strict = active.strict;
+			runtime.pauseCompactionRecoveryBudget();
+			if (runtime.consolidationInFlight) runtime.abortConsolidation("coordination lease expired");
+			finishCheckpoint("failed", "coordination lease expired before checkpoint completion", undefined, "lease-expired");
+			if (strict && runtime.pendingCompaction?.state !== "blocked") scheduleRecovery(ctx, 0);
+			else schedule(ctx, 0);
+		}, Math.max(0, event.expiresAt - Date.now()));
+		if (checkpoint.strict && runtime.pendingCompaction) scheduleRecovery(checkpoint.ctx, 0);
+		else schedule(checkpoint.ctx, 0);
+	});
+	pi.events.on(CHECKPOINT_RELEASE_EVENT, (event: unknown) => {
+		if (!checkpoint || !isCheckpointRelease(event)) return;
+		const request = checkpoint.request;
+		if (
+			event.requestId !== request.requestId
+			|| event.requesterGeneration !== runtime.lifecycleGeneration
+			|| event.requesterGeneration !== request.requesterGeneration
+			|| event.boundaryKey !== request.boundaryKey
+			|| event.targetEntryId !== request.targetEntryId
+			|| event.branchHeadId !== request.branchHeadId
+			|| (checkpoint.lease ? event.leaseId !== checkpoint.lease.leaseId : event.leaseId !== undefined)
+		) return;
+		const ctx = checkpoint.ctx;
+		const strict = checkpoint.strict;
+		clearCheckpointTimers(checkpoint);
+		checkpoint = undefined;
+		runtime.observerCheckpointTargetEntryId = undefined;
+		clearSchedule();
+		clearRecovery();
+		runtime.pauseCompactionRecoveryBudget();
+		if (runtime.consolidationInFlight) runtime.abortConsolidation(`checkpoint ${event.reason}`);
+		if (event.reason === "coordinator-disabled") {
+			convergenceSeen = false;
+			if (strict && runtime.pendingCompaction?.state !== "blocked") scheduleRecovery(ctx);
+			else schedule(ctx);
+		} else if (event.reason !== "session-changed") {
+			if (strict && runtime.pendingCompaction?.state !== "blocked") scheduleRecovery(ctx, 0);
+			else schedule(ctx, 0);
+		}
+	});
 	pi.events.on("pi-convergence:state", (event: any) => {
+		convergenceSeen = event?.mode === undefined || event.mode === "enabled";
 		const phase = event?.phase;
 		if (
 			phase !== "judging"
 			&& phase !== "continuation"
 			&& lastCtx
 			&& runtime.pendingCompaction
-		) scheduleRecovery(lastCtx, 0);
+			&& runtime.pendingCompaction.state !== "blocked"
+		) {
+			if (convergenceSeen && !checkpoint) {
+				requestCheckpoint(lastCtx, true);
+			}
+			if (!checkpoint || !checkpoint.requiresGrant || checkpointLeaseIsUsable()) scheduleRecovery(lastCtx, 0);
+		}
 	});
 
 	const invalidate = () => {
+		if (checkpoint?.lease) finishCheckpoint("aborted", "session or branch changed", undefined, "session-changed");
+		else if (checkpoint) cancelPendingCheckpoint("session-changed");
 		clearSchedule();
 		clearRecovery();
 		runtime.invalidateConsolidation();
@@ -483,15 +917,21 @@ function maybeLaunchStage(
 	ctx: ConsolidationCtx,
 	schedule: (ctx: ConsolidationCtx, delayMs?: number) => void,
 	scheduleRecovery: (ctx: ConsolidationCtx, delayMs?: number) => void,
+	blockRecovery: (ctx: ConsolidationCtx, reason: string, retryAt?: number) => void,
+	onObserverProgress: (entries: Entry[]) => boolean,
+	onObserverFailure: (error?: string) => boolean,
+	checkpointCanRun: () => boolean,
+	shouldRescheduleAfterAbort: () => boolean,
 ): void {
 	runtime.ensureConfig(ctx.cwd);
 	if (runtime.config.passive || runtime.consolidationInFlight) return;
+	if (runtime.pendingCompaction?.state === "blocked") return;
 	if (runtime.compactInFlight || runtime.compactHookInFlight || runtime.convergenceControlInFlight) return;
 	if (!isContextIdle(ctx)) return;
-
 	const entries = ctx.sessionManager.getBranch() as Entry[];
 	const due = findDueStage(entries, runtime);
 	if (!due) return;
+	if (due.phase === "observer" && !checkpointCanRun()) return;
 	const retryAt = runtime.stageRetryAt(due.phase, due.watermark);
 	if (retryAt !== undefined) {
 		schedule(ctx, retryAt - Date.now());
@@ -510,19 +950,59 @@ function maybeLaunchStage(
 		runId,
 	}, async () => {
 		debugLog("background_lease_acquired", { phase: due.phase, waitedMs });
-		return runStage(pi, runtime, ctx, due.phase, {
-			generation,
-			signal: leaseSignal,
-			sessionId: sessionMetadata.sessionId,
-		});
+		const recoveryBudgetRunning = due.phase === "observer"
+			&& runtime.resumeCompactionRecoveryBudget();
+		try {
+			return await runStage(pi, runtime, ctx, due.phase, {
+				generation,
+				signal: leaseSignal,
+				sessionId: sessionMetadata.sessionId,
+			});
+		} finally {
+			if (recoveryBudgetRunning) runtime.pauseCompactionRecoveryBudget();
+		}
 	}))).then((result) => {
 		if (result.status === "aborted") {
-			if (runtime.pendingCompaction) scheduleRecovery(ctx);
+			if (runtime.pendingCompaction && shouldRescheduleAfterAbort()) scheduleRecovery(ctx);
 			return;
 		}
+		if (result.status === "success" && result.phase === "observer") {
+			const entries = ctx.sessionManager.getBranch() as Entry[];
+			if (onObserverProgress(entries)) {
+				return;
+			}
+		}
 		if (result.status === "success" && result.phase === "observer" && runtime.compactionDeferred) {
-			runtime.markCompactionReady();
-			scheduleRecovery(ctx, 0);
+			const pending = runtime.pendingCompaction;
+			if (!pending || pending.state === "blocked") return;
+			const entries = ctx.sessionManager.getBranch() as Entry[];
+			if (latestCompactionBoundaryKey(entries) !== pending.boundaryKey) {
+				runtime.clearCompactionDeferral();
+				return;
+			}
+			const checkpointTarget = runtime.observerCheckpointTargetEntryId;
+			const checkpointTargetCovered = !checkpointTarget || (() => {
+				const targetIndex = entries.findIndex((entry) => entry.id === checkpointTarget);
+				return targetIndex >= 0 && latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED) >= targetIndex;
+			})();
+			if (observationCoverageIncludesCompactionPrefix(entries, pending.cutKey) && checkpointTargetCovered) {
+				runtime.markCompactionReady();
+				scheduleRecovery(ctx, 0);
+				return;
+			}
+			if (runtime.isCompactionRecoveryBudgetExpired()) {
+				if (isStrictRecovery(runtime)) {
+					blockRecovery(ctx, "effective observer recovery budget was exhausted before the compaction cut was covered");
+				} else {
+					runtime.markCompactionReady();
+					scheduleRecovery(ctx, 0);
+				}
+				return;
+			}
+			// A bounded observer batch may make durable progress without covering
+			// the requested cut. Keep recovery active and consume the next prefix.
+			maybeLaunchStage(pi, runtime, ctx, schedule, scheduleRecovery, blockRecovery, onObserverProgress, onObserverFailure, checkpointCanRun, shouldRescheduleAfterAbort);
+			scheduleRecovery(ctx);
 			return;
 		}
 		if (!isContextIdle(ctx)) {
@@ -535,14 +1015,33 @@ function maybeLaunchStage(
 		}
 
 		const failure = runtime.stageFailureStatus(result.phase);
+			const checkpointFailureHandled = result.phase === "observer"
+				&& result.status === "failed"
+				&& onObserverFailure(result.error);
+			if (checkpointFailureHandled) {
+				const retryAt = runtime.stageRetryAt(result.phase, result.watermark) ?? result.retryAt;
+				if (retryAt !== undefined) schedule(ctx, retryAt - Date.now());
+				return;
+			}
 		if (
 			result.phase === "observer"
 			&& runtime.compactionDeferred
 			&& ((failure?.failures ?? 0) >= 2 || failure?.circuitOpenUntil !== undefined)
 		) {
-			runtime.markCompactionReady();
-			scheduleRecovery(ctx, 0);
-			return;
+			if (isStrictRecovery(runtime)) {
+				if (failure?.circuitOpenUntil !== undefined) {
+					blockRecovery(
+						ctx,
+						`observer recovery circuit opened before the compaction cut was covered: ${failure.lastError}`,
+						failure.circuitOpenUntil,
+					);
+					return;
+				}
+			} else {
+				runtime.markCompactionReady();
+				scheduleRecovery(ctx, 0);
+				return;
+			}
 		}
 		const retryAt = runtime.stageRetryAt(result.phase, result.watermark) ?? result.retryAt;
 		if (retryAt !== undefined) schedule(ctx, retryAt - Date.now());
@@ -640,9 +1139,20 @@ async function runObserverStage(
 ): Promise<boolean> {
 	const entries = ctx.sessionManager.getBranch() as Entry[];
 	const tokens = rawTokensSinceObservationCoverage(entries);
-	if (!runtime.compactionDeferred && tokens < runtime.config.observeAfterTokens) return true;
+	if (
+		!isCoverageRecoveryWaiting(runtime)
+		&& !runtime.observerCheckpointTargetEntryId
+		&& tokens < runtime.config.observeAfterTokens
+	) return true;
 	const lastCoverageIdx = latestCoverageIndex(entries, OM_OBSERVATIONS_RECORDED);
-	const chunkEntries = sourceEntriesAfter(entries, lastCoverageIdx);
+	const checkpointTargetIndex = runtime.observerCheckpointTargetEntryId
+		? entries.findIndex((entry) => entry.id === runtime.observerCheckpointTargetEntryId)
+		: -1;
+	const checkpointEndIndex = checkpointTargetIndex >= 0 ? checkpointTargetIndex + 1 : entries.length;
+	// A checkpoint leases an immutable prefix, not the live branch tail. New
+	// suffix entries may exist by the time the provider starts, but they must be
+	// left for a later request instead of widening this lease implicitly.
+	const chunkEntries = entries.slice(lastCoverageIdx + 1, checkpointEndIndex).filter(isSourceEntry);
 	if (chunkEntries.length === 0) return true;
 
 	const memory = fullProjection(entries);
@@ -658,7 +1168,9 @@ async function runObserverStage(
 		emptyCoverageCommit: runtime.config.observerEmptyCoverageCommit,
 	});
 	const coversUpToId = selection.coversUpToId;
-	if (!coversUpToId || !selection.chunk.trim() || selection.allowedSourceEntryIds.length === 0) return true;
+	if (!coversUpToId || !selection.chunk.trim() || selection.allowedSourceEntryIds.length === 0) {
+		return !isCoverageRecoveryWaiting(runtime);
+	}
 
 	if (shouldNotifyWorker(runtime, ctx)) ctx.ui?.notify(`Observational memory: observer running on ~${tokens.toLocaleString()}-token chunk`, "info");
 	const resolved = await resolveModel("observer");
